@@ -2,10 +2,4 @@
 export GLOO_SOCKET_IFNAME="eno1"
 export MASTER_ADDR="192.168.1.191"
 export MASTER_PORT=12355
-<<<<<<< HEAD
 export NCCL_BLOCKING_WAIT=1
-    os.environ["TORCH_CPP_LOG_LEVEL"]="INFO"
-    os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
-=======
-export NCCL_BLOCKING_WAIT=1
->>>>>>> 29007e116261d58b8200235ca8605baf606026cf
