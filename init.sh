@@ -1,0 +1,5 @@
+#!/bin/bash
+export GLOO_SOCKET_IFNAME="eno1"
+export MASTER_ADDR="192.168.1.191"
+export MASTER_PORT=12355
+export NCCL_BLOCKING_WAIT=1
