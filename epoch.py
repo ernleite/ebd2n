@@ -2,6 +2,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from ignite.engine import Engine, Events
+import torchvision
+import torchvision.transforms as transforms
 import os
 import time
 import socket
@@ -69,35 +71,42 @@ def create_master_engine():
     
     def master_step(engine, batch):
         try:
-            # Create a matrix of size (100, 1)
-            matrix = torch.randn(1000000, 1)
-            print(f"Master created matrix with shape: {matrix.shape}")
-            print(f"Matrix content (first 5 elements): {matrix[:5].flatten()}")
+            # Load MNIST dataset
+            transform = transforms.ToTensor()
+            dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+            data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
             
-            # Send matrix to worker node (rank 1)
-            print("Sending matrix to worker node...")
-            dist.send(matrix, dst=1)
-            print("Matrix sent successfully!")
-            
-            # Receive result from worker node
-            result = torch.zeros(1)  # Prepare tensor to receive the sum
-            print("Waiting for result from worker node...")
-            
-            # Add timeout for receiving
-            dist.recv(result, src=1)
-            print("Result received successfully!")
-            
-            print(f"Received sum from worker: {result.item()}")
-            
-            return {
-                'original_matrix': matrix,
-                'sum_result': result.item(),
-                'status': 'success'
-            }
-            
+            for i, (image, label) in enumerate(data_loader):
+                if i >= engine.state.iteration:
+                    image = image.squeeze(0)  # Remove batch dimension
+                    print(f"Master processing image {i} with shape: {image.shape}")
+                    
+                    # Send image matrix to worker node (rank 1)
+                    print("Sending image to worker node...")
+                    dist.send(image, dst=1)
+                    print("Image sent successfully!")
+                    
+                    # Receive weighted sum from worker node
+                    result = torch.zeros(1)  # Prepare tensor to receive the sum
+                    print("Waiting for weighted sum from worker node...")
+                    
+                    # Add timeout for receiving
+                    dist.recv(result, src=1)
+                    print("Weighted sum received successfully!")
+                    
+                    print(f"Received weighted sum from worker: {result.item()}")
+                    
+                    yield {
+                        'original_image': image,
+                        'weighted_sum': result.item(),
+                        'status': 'success'
+                    }
+                    
+                    engine.state.iteration += 1
+                    
         except Exception as e:
             print(f"Error in master step: {e}")
-            return {
+            yield {
                 'status': 'error',
                 'error': str(e)
             }
@@ -120,7 +129,7 @@ def run_master():
         result = engine.state.output
         if result.get('status') == 'success':
             print(f"Iteration {engine.state.iteration} completed successfully")
-            print(f"Sum result: {result['sum_result']}")
+            print(f"Weighted sum: {result['weighted_sum']}")
         else:
             print(f"Iteration {engine.state.iteration} failed: {result.get('error', 'Unknown error')}")
         print("-" * 50)
@@ -131,7 +140,7 @@ def run_master():
         cleanup_distributed()
     
     # Create dummy data for the engine (we just need something to iterate over)
-    dummy_data = [None] * 3  # Run 3 iterations as example
+    dummy_data = [None]  # Run until MNIST dataset is exhausted
     
     # Run the engine
     print("Master node ready. Starting processing...")
