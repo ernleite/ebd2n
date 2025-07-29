@@ -69,44 +69,138 @@ def cleanup_distributed():
 def create_master_engine():
     """Create the master node engine"""
     
+    # Configuration
+    split = 4  # Number of splits for the vector
+    batch_size = 25  # Number of images to process before displaying results
+    
+    # Store dataset globally to avoid reloading
+    transform = transforms.ToTensor()
+    dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+    data_iter = iter(data_loader)
+    
+    # Batch tracking variables
+    current_batch = []
+    batch_number = 1
+    
     def master_step(engine, batch):
+        nonlocal current_batch, batch_number
+        
         try:
-            # Load MNIST dataset
-            transform = transforms.ToTensor()
-            dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-            data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+            # Get next image from iterator
+            image, label = next(data_iter)
+            image = image.squeeze(0)  # Remove batch dimension
             
-            for i, (image, label) in enumerate(data_loader):
-                if i >= engine.state.iteration:
-                    image = image.squeeze(0)  # Remove batch dimension
-                    print(f"Master processing image {i} with shape: {image.shape}")
+            # Transform 28x28 matrix to 784x1 vector
+            vector = image.view(-1, 1)  # Reshape to (784, 1)
+            
+            # Calculate split size
+            vector_size = vector.size(0)  # 784
+            split_size = vector_size // split  # 784 / 4 = 196
+            
+            # Split the vector and process each split
+            split_results = []
+            for i in range(split):
+                start_idx = i * split_size
+                end_idx = (i + 1) * split_size if i < split - 1 else vector_size
+                vector_split = vector[start_idx:end_idx]
+                
+                # Send vector split to worker node (rank 1) - silent processing
+                dist.send(vector_split, dst=1)
+                
+                # Receive result from worker node
+                result = torch.zeros(1)
+                dist.recv(result, src=1)
+                
+                split_results.append(result.item())
+            
+            # Store image results in current batch
+            image_result = {
+                'image_index': engine.state.iteration,
+                'original_image': image,
+                'vector_shape': vector.shape,
+                'split_results': split_results,
+                'total_splits': split,
+                'split_size': split_size,
+                'sum_of_splits': sum(split_results)
+            }
+            
+            current_batch.append(image_result)
+            
+            # Check if batch is complete
+            if len(current_batch) >= batch_size:
+                # Display batch results
+                print(f"\n{'='*80}")
+                print(f"BATCH {batch_number} COMPLETED ({batch_size} images)")
+                print(f"{'='*80}")
+                
+                for i, img_result in enumerate(current_batch):
+                    print(f"Image {img_result['image_index']:3d} | Splits: {img_result['split_results']} | Sum: {img_result['sum_of_splits']:.4f}")
+                
+                # Calculate batch statistics
+                batch_sums = [img['sum_of_splits'] for img in current_batch]
+                batch_total = sum(batch_sums)
+                batch_avg = batch_total / len(batch_sums)
+                
+                print(f"{'-'*80}")
+                print(f"BATCH {batch_number} SUMMARY:")
+                print(f"  Total sum: {batch_total:.4f}")
+                print(f"  Average per image: {batch_avg:.4f}")
+                print(f"  Min: {min(batch_sums):.4f} | Max: {max(batch_sums):.4f}")
+                print(f"{'='*80}\n")
+                
+                # Prepare return data for this completed batch
+                batch_data = {
+                    'batch_number': batch_number,
+                    'batch_size': len(current_batch),
+                    'batch_results': current_batch.copy(),
+                    'batch_total': batch_total,
+                    'batch_average': batch_avg,
+                    'status': 'batch_complete'
+                }
+                
+                # Reset for next batch
+                current_batch = []
+                batch_number += 1
+                
+                return batch_data
+            else:
+                # Batch not complete yet, continue silently
+                return {
+                    'batch_number': batch_number,
+                    'images_in_batch': len(current_batch),
+                    'remaining': batch_size - len(current_batch),
+                    'status': 'batch_in_progress'
+                }
                     
-                    # Send image matrix to worker node (rank 1)
-                    print("Sending image to worker node...")
-                    dist.send(image, dst=1)
-                    print("Image sent successfully!")
-                    
-                    # Receive weighted sum from worker node
-                    result = torch.zeros(1)  # Prepare tensor to receive the sum
-                    print("Waiting for weighted sum from worker node...")
-                    
-                    # Add timeout for receiving
-                    dist.recv(result, src=1)
-                    print("Weighted sum received successfully!")
-                    
-                    print(f"Received weighted sum from worker: {result.item()}")
-                    
-                    yield {
-                        'original_image': image,
-                        'weighted_sum': result.item(),
-                        'status': 'success'
-                    }
-                    
-                    engine.state.iteration += 1
-                    
+        except StopIteration:
+            # Process remaining images in incomplete batch
+            if current_batch:
+                print(f"\n{'='*80}")
+                print(f"FINAL BATCH {batch_number} COMPLETED ({len(current_batch)} images)")
+                print(f"{'='*80}")
+                
+                for i, img_result in enumerate(current_batch):
+                    print(f"Image {img_result['image_index']:3d} | Splits: {img_result['split_results']} | Sum: {img_result['sum_of_splits']:.4f}")
+                
+                batch_sums = [img['sum_of_splits'] for img in current_batch]
+                batch_total = sum(batch_sums)
+                batch_avg = batch_total / len(batch_sums)
+                
+                print(f"{'-'*80}")
+                print(f"FINAL BATCH {batch_number} SUMMARY:")
+                print(f"  Total sum: {batch_total:.4f}")
+                print(f"  Average per image: {batch_avg:.4f}")
+                print(f"{'='*80}\n")
+            
+            return {
+                'status': 'complete',
+                'message': f'All images processed. Total batches: {batch_number}',
+                'final_batch_size': len(current_batch) if current_batch else 0
+            }
         except Exception as e:
             print(f"Error in master step: {e}")
-            yield {
+            return {
                 'status': 'error',
                 'error': str(e)
             }
@@ -127,20 +221,32 @@ def run_master():
     @engine.on(Events.ITERATION_COMPLETED)
     def log_results(engine):
         result = engine.state.output
-        if result.get('status') == 'success':
-            print(f"Iteration {engine.state.iteration} completed successfully")
-            print(f"Weighted sum: {result['weighted_sum']}")
+        if result.get('status') == 'batch_complete':
+            # Batch completed - results already displayed in master_step
+            pass
+        elif result.get('status') == 'batch_in_progress':
+            # Show progress indicator for current batch
+            print(f"Batch {result['batch_number']}: {result['images_in_batch']}/{result['images_in_batch'] + result['remaining']} images processed", end='\r')
+        elif result.get('status') == 'complete':
+            print(f"\n🎉 ALL PROCESSING COMPLETE!")
+            print(f"Final message: {result.get('message', 'Done')}")
+            if result.get('final_batch_size', 0) > 0:
+                print(f"Final incomplete batch had {result['final_batch_size']} images")
+            engine.terminate()  # Stop the engine
         else:
             print(f"Iteration {engine.state.iteration} failed: {result.get('error', 'Unknown error')}")
-        print("-" * 50)
+        
+        # Only print separator for errors or completion
+        if result.get('status') in ['error', 'complete']:
+            print("=" * 60)
     
     @engine.on(Events.COMPLETED)
     def on_complete(engine):
         print("Master node processing completed!")
         cleanup_distributed()
     
-    # Create dummy data for the engine (we just need something to iterate over)
-    dummy_data = [None]  # Run until MNIST dataset is exhausted
+    # Create dummy data for the engine (MNIST has ~10k test images)
+    dummy_data = [None] * 10000  # Enough iterations for full dataset
     
     # Run the engine
     print("Master node ready. Starting processing...")
