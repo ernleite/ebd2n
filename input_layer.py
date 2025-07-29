@@ -1,142 +1,350 @@
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import os
+import time
 import socket
 from datetime import timedelta
+import sys
+import signal
+import argparse
 
-def check_port_available(port):
-    """Check if port is available"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(('', int(port)))
+def test_network_connectivity(master_addr, master_port, timeout=10):
+    """Test if we can connect to the master node"""
+    print(f"[Worker] Testing network connectivity to {master_addr}:{master_port}...")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            result = s.connect_ex((master_addr, int(master_port)))
+            if result == 0:
+                print(f"[Worker] ✓ Network connectivity successful")
+                return True
+            else:
+                print(f"[Worker] ✗ Cannot connect (error code: {result})")
+                return False
+    except Exception as e:
+        print(f"[Worker] ✗ Network test failed: {e}")
+        return False
+
+def wait_for_master(master_addr, master_port, max_wait=60):
+    """Wait for master to be available"""
+    print(f"[Worker] Waiting for master to become available...")
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait:
+        if test_network_connectivity(master_addr, master_port, timeout=2):
             return True
-        except OSError:
-            return False
+        print(f"[Worker] Master not ready yet, retrying in 2 seconds...")
+        time.sleep(2)
+    
+    print(f"[Worker] ❌ Master did not become available within {max_wait} seconds")
+    return False
 
 def setup_distributed(rank, world_size, master_addr="192.168.1.191", master_port="12355"):
-    """Initialize distributed training"""
+    """Initialize distributed training with comprehensive error handling"""
+    
+    # Set environment variables
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = master_port
     
-    print(f"Setting up distributed training:")
-    print(f"  Rank: {rank}")
-    print(f"  World size: {world_size}")
-    print(f"  Master addr: {master_addr}")
-    print(f"  Master port: {master_port}")
+    # Optional: Force specific network interface if needed
+    # os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'  
+    # os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
     
-    if rank == 0:
-        if not check_port_available(master_port):
-            print(f"Warning: Port {master_port} may be in use")
+    print(f"[Worker {rank}] Setting up distributed training:")
+    print(f"[Worker {rank}]   Rank: {rank}")
+    print(f"[Worker {rank}]   World size: {world_size}")
+    print(f"[Worker {rank}]   Master addr: {master_addr}")
+    print(f"[Worker {rank}]   Master port: {master_port}")
+    
+    # Wait for master to be available
+    if not wait_for_master(master_addr, master_port):
+        raise ConnectionError(f"Cannot reach master node at {master_addr}:{master_port}")
     
     try:
-        # Initialize the process group with timeout
-        dist.init_process_group(
-            backend="gloo", 
-            rank=rank, 
-            init_method=f"tcp://{master_addr}:{master_port}", 
-            world_size=world_size,
-            timeout=timedelta(minutes=0.3)
-        )
-        print(f"Successfully initialized process group for rank {rank}")
+        print(f"[Worker {rank}] Attempting to join process group...")
         
-        # Test connection
-        if rank == 0:
-            print("Master node waiting for worker connection...")
-            # Send a test tensor
-            test_tensor = torch.tensor([1.0])
-            dist.send(test_tensor, dst=1)
-            print("Test connection successful - worker connected!")
-        else:
-            # Receive test tensor
+        # Initialize with longer timeout and better error messages
+        dist.init_process_group(
+            backend="gloo",  # gloo is more reliable for CPU-based communication
+            rank=rank,
+            init_method=f"tcp://{master_addr}:{master_port}",
+            world_size=world_size,
+            timeout=timedelta(minutes=3)  # Longer timeout
+        )
+        
+        print(f"[Worker {rank}] ✓ Successfully joined process group")
+        
+        # Wait for all processes to be ready
+        print(f"[Worker {rank}] Synchronizing with all processes...")
+        dist.barrier()  # This will wait for all processes
+        print(f"[Worker {rank}] ✓ All {world_size} processes synchronized!")
+        
+        # Connection test with master
+        try:
             test_tensor = torch.zeros(1)
+            print(f"[Worker {rank}] Waiting for connection test from master...")
             dist.recv(test_tensor, src=0)
-            print("Test connection successful - connected to master!")
-            
+            print(f"[Worker {rank}] ✓ Connection test successful: received {test_tensor.item()}")
+        except Exception as e:
+            print(f"[Worker {rank}] ✗ Connection test failed: {e}")
+            raise
+                
     except Exception as e:
-        print(f"Failed to initialize distributed training: {e}")
-        print("Make sure both nodes are running and network is accessible")
+        print(f"\n[Worker {rank}] ❌ FAILED TO INITIALIZE DISTRIBUTED TRAINING:")
+        print(f"[Worker {rank}] Error: {e}")
+        print_troubleshooting_tips(rank, master_addr, master_port)
         raise
+
+def print_troubleshooting_tips(rank, master_addr, master_port):
+    """Print comprehensive troubleshooting information"""
+    print(f"\n[Worker {rank}] TROUBLESHOOTING CHECKLIST:")
+    print(f"[Worker {rank}] 1. Is the master node running?")
+    print(f"[Worker {rank}] 2. Can you ping {master_addr}?")
+    print(f"[Worker {rank}] 3. Is port {master_port} open in firewall?")
+    print(f"[Worker {rank}] 4. Try: telnet {master_addr} {master_port}")
+    print(f"[Worker {rank}] 5. Are you on the same network as master?")
+    print(f"[Worker {rank}] 6. Check if master changed to a different port")
+    print(f"[Worker {rank}] 7. Ensure master started before workers")
 
 def cleanup_distributed():
     """Clean up distributed training"""
-    dist.destroy_process_group()
-
-def run_worker():
-    """Run the worker node"""
-    print("Starting Worker Node")
-    
-    # Configuration
-    nextLayerSize = 100
-    seed = 123
-    
-    # Setup distributed environment
-    setup_distributed(rank=1, world_size=2)
-    
-    # Set random seed for reproducible weights
-    torch.manual_seed(seed)
-    print(f"Random seed set to {seed} for reproducible weights")
-    
-    weights_cache = {}  # Cache weights for different input sizes
-    
-    while True:
+    if dist.is_initialized():
         try:
-            # First, we need to determine the size of incoming vector
-            # We'll receive vectors of size 196 (784/4) based on master configuration
-            vector_size = 196  # This should match split_size from master
-            
-            # Receive vector from master node
-            received_vector = torch.zeros(vector_size, 1)  # Shape: [196, 1]
-            print(f"Waiting for vector from master node (expected size: {vector_size})...")
-            dist.recv(received_vector, src=0)
-            print(f"Vector received successfully! Shape: {received_vector.shape}")
-            
-            # Get actual input size from received vector
-            input_size = received_vector.shape[0]  # Should be 196
-            
-            # Generate or retrieve weights matrix
-            if input_size not in weights_cache:
-                # Generate weights matrix of size [nextLayerSize, input_size]
-                # Reset seed to ensure consistent weights for same input size
-                torch.manual_seed(seed)
-                weights = torch.randn(nextLayerSize, input_size)  # Shape: [100, 196]
-                weights_cache[input_size] = weights
-                print(f"Generated new weights matrix of shape: {weights.shape}")
-            else:
-                weights = weights_cache[input_size]
-                print(f"Using cached weights matrix of shape: {weights.shape}")
-            
-            # Matrix multiplication: weights @ received_vector
-            # [100, 196] @ [196, 1] = [100, 1]
-            result_vector = torch.matmul(weights, received_vector)
-            print(f"Matrix multiplication completed. Result shape: {result_vector.shape}")
-            
-            # Ensure result is the correct shape [nextLayerSize, 1]
-            assert result_vector.shape == (nextLayerSize, 1), f"Result shape {result_vector.shape} != expected {(nextLayerSize, 1)}"
-            
-            # For sending back to master, we need to send a scalar (sum of the result vector)
-            # or we can send the full vector - let's send the sum as a scalar to match master expectations
-            result_sum = torch.sum(result_vector)
-            print(f"Calculated result sum: {result_sum.item()}")
-            
-            # Send result back to master node
-            print("Sending result to master node...")
-            dist.send(result_sum, dst=0)
-            print("Result sent successfully!")
-            print("-" * 50)
-            
-        except RuntimeError as e:
-            if "Connection closed by peer" in str(e) or "recv" in str(e):
-                print("Master node disconnected. Shutting down worker...")
-                break
-            else:
-                print(f"Runtime error in worker: {e}")
-                break
-        except Exception as e:
-            print(f"Error in worker: {e}")
-            break
+            dist.destroy_process_group()
+            print("[Worker] ✓ Distributed cleanup completed")
+        except:
+            pass
+
+def worker_process(rank, world_size, master_addr, master_port):
+    """Enhanced worker process with robust error handling"""
+    print(f"=" * 60)
+    print(f"STARTING WORKER RANK {rank}")
+    print(f"=" * 60)
     
-    print("Worker shutting down...")
-    cleanup_distributed()
+    try:
+        print(f"[Worker {rank}] Initializing...")
+        
+        # Setup distributed environment
+        setup_distributed(rank, world_size, master_addr, master_port)
+        
+        print(f"[Worker {rank}] ✓ Ready for processing!")
+        print(f"[Worker {rank}] Entering main processing loop...")
+        print(f"-" * 60)
+        
+        # Processing statistics
+        total_processed = 0
+        start_time = time.time()
+        last_report_time = start_time
+        
+        # Worker processing loop
+        while True:
+            try:
+                # Receive the size of incoming data first
+                size_tensor = torch.zeros(1, dtype=torch.long)
+                dist.recv(size_tensor, src=0)
+                split_size = int(size_tensor.item())
+                
+                # Handle control signals
+                if split_size == -1:  # Shutdown signal
+                    print(f"[Worker {rank}] 🛑 Received shutdown signal")
+                    break
+                elif split_size == 0:  # Heartbeat/ping signal
+                    print(f"[Worker {rank}] 💓 Received heartbeat")
+                    heartbeat_response = torch.tensor([rank], dtype=torch.long)
+                    dist.send(heartbeat_response, dst=0)
+                    continue
+                elif split_size < 0:  # Other control signals
+                    print(f"[Worker {rank}] Received control signal: {split_size}")
+                    continue
+                
+                # Receive the actual vector split
+                vector_split = torch.zeros(split_size, 1)
+                dist.recv(vector_split, src=0)
+                
+                # Process the vector split (compute sum as example operation)
+                # You can modify this to do different computations
+                result = torch.sum(vector_split)
+                
+                # Send result back to master
+                dist.send(result.unsqueeze(0), dst=0)
+                
+                total_processed += 1
+                
+                # Report progress every 50 operations or every 10 seconds
+                current_time = time.time()
+                if (total_processed % 50 == 0) or (current_time - last_report_time > 10):
+                    elapsed = current_time - start_time
+                    rate = total_processed / elapsed if elapsed > 0 else 0
+                    print(f"[Worker {rank}] Processed {total_processed} splits | Rate: {rate:.2f}/sec | Size: {split_size} | Result: {result.item():.4f}")
+                    last_report_time = current_time
+                
+            except RuntimeError as e:
+                error_msg = str(e).lower()
+                if any(keyword in error_msg for keyword in ["connection", "recv", "send", "peer", "socket"]):
+                    print(f"[Worker {rank}] ⚠️  Connection lost with master, shutting down...")
+                    break
+                else:
+                    print(f"[Worker {rank}] ❌ Runtime error: {e}")
+                    raise
+            except Exception as e:
+                print(f"[Worker {rank}] ❌ Unexpected error: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+        
+        # Final statistics
+        final_time = time.time()
+        total_elapsed = final_time - start_time
+        avg_rate = total_processed / total_elapsed if total_elapsed > 0 else 0
+        
+        print(f"\n[Worker {rank}] 📊 FINAL STATISTICS:")
+        print(f"[Worker {rank}]   Total splits processed: {total_processed}")
+        print(f"[Worker {rank}]   Total time: {total_elapsed:.2f}s")
+        print(f"[Worker {rank}]   Average rate: {avg_rate:.2f} splits/second")
+        
+    except KeyboardInterrupt:
+        print(f"\n[Worker {rank}] 🛑 Interrupted by user")
+    except Exception as e:
+        print(f"\n[Worker {rank}] ❌ Failed to start or run: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        cleanup_distributed()
+        print(f"[Worker {rank}] 👋 Worker process terminated")
+
+def get_local_ip():
+    """Get the local IP address of this machine"""
+    try:
+        # Connect to a remote address to determine local IP
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            return local_ip
+    except Exception:
+        return "unknown"
+
+def run_interactive_setup():
+    """Interactive setup for worker configuration"""
+    print("=" * 60)
+    print("INTERACTIVE WORKER SETUP")
+    print("=" * 60)
+    
+    # Get local IP for reference
+    local_ip = get_local_ip()
+    print(f"Local machine IP: {local_ip}")
+    
+    # Get configuration from user
+    try:
+        rank = int(input("Enter worker rank (1, 2, 3, ...): "))
+        if rank < 1:
+            print("Rank must be >= 1")
+            return None
+    except ValueError:
+        print("Invalid rank. Must be a number.")
+        return None
+    
+    master_addr = input(f"Enter master IP address [192.168.1.191]: ").strip()
+    if not master_addr:
+        master_addr = "192.168.1.191"
+    
+    master_port = input(f"Enter master port [12355]: ").strip()
+    if not master_port:
+        master_port = "12355"
+    
+    world_size = input(f"Enter world size (total nodes including master) [3]: ").strip()
+    if not world_size:
+        world_size = 3
+    else:
+        try:
+            world_size = int(world_size)
+        except ValueError:
+            print("Invalid world size. Using default 3.")
+            world_size = 3
+    
+    print(f"\nConfiguration:")
+    print(f"  Worker rank: {rank}")
+    print(f"  Master: {master_addr}:{master_port}")
+    print(f"  World size: {world_size}")
+    print(f"  Local IP: {local_ip}")
+    
+    confirm = input(f"\nProceed with this configuration? [y/N]: ").strip().lower()
+    if confirm in ['y', 'yes']:
+        return rank, world_size, master_addr, master_port
+    else:
+        print("Setup cancelled.")
+        return None
+
+def main():
+    """Main worker entry point with multiple launch modes"""
+    
+    # Set multiprocessing start method for compatibility
+    mp.set_start_method('spawn', force=True)
+    
+    parser = argparse.ArgumentParser(description='Distributed Worker Node')
+    parser.add_argument('--rank', type=int, help='Worker rank (1, 2, 3, ...)')
+    parser.add_argument('--world-size', type=int, default=3, help='Total world size including master')
+    parser.add_argument('--master-addr', default='192.168.1.191', help='Master node IP address')
+    parser.add_argument('--master-port', default='12355', help='Master node port')
+    parser.add_argument('--interactive', action='store_true', help='Run interactive setup')
+    
+    args = parser.parse_args()
+    
+    # Interactive mode
+    if args.interactive or args.rank is None:
+        setup = run_interactive_setup()
+        if setup is None:
+            return
+        rank, world_size, master_addr, master_port = setup
+    else:
+        # Command line mode
+        rank = args.rank
+        world_size = args.world_size
+        master_addr = args.master_addr
+        master_port = args.master_port
+    
+    # Validate configuration
+    if rank >= world_size:
+        print(f"Error: Rank {rank} must be less than world size {world_size}")
+        return
+    
+    if rank < 1:
+        print(f"Error: Worker rank must be >= 1 (rank 0 is reserved for master)")
+        return
+    
+    print(f"\n🚀 Starting worker with configuration:")
+    print(f"   Rank: {rank}")
+    print(f"   World size: {world_size}")
+    print(f"   Master: {master_addr}:{master_port}")
+    
+    # Test connectivity before starting
+    print(f"\n🔍 Pre-flight checks...")
+    if not test_network_connectivity(master_addr, master_port, timeout=5):
+        print(f"\n❌ Cannot reach master node!")
+        print(f"Please ensure:")
+        print(f"  1. Master node is running")
+        print(f"  2. IP address {master_addr} is correct")
+        print(f"  3. Port {master_port} is open")
+        print(f"  4. No firewall blocking the connection")
+        
+        retry = input(f"\nTry anyway? [y/N]: ").strip().lower()
+        if retry not in ['y', 'yes']:
+            print("Startup cancelled.")
+            return
+    
+    try:
+        # Run the worker
+        worker_process(rank, world_size, master_addr, master_port)
+    except KeyboardInterrupt:
+        print(f"\n🛑 Worker interrupted by user")
+    except Exception as e:
+        print(f"\n❌ Worker failed: {e}")
 
 if __name__ == "__main__":
-    run_worker()
+    # Handle different launch methods
+    if len(sys.argv) == 1:
+        # No arguments - run interactive mode
+        print("No arguments provided. Starting interactive setup...")
+        sys.argv.append('--interactive')
+    
+    main()
