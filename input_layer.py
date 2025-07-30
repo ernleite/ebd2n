@@ -1,4 +1,4 @@
-# ENHANCED INPUT LAYER NODE WITH IMAGE INDEXING
+# ENHANCED INPUT LAYER NODE WITH MICRO-BATCHING
 
 import torch
 import torch.distributed as dist
@@ -129,10 +129,10 @@ def cleanup_distributed():
             pass
 
 def worker_process(rank, world_size, activation_rank, master_addr, master_port):
-    """ENHANCED input worker process - receives image index + vector split"""
+    """MICRO-BATCHING ENHANCED input worker process - receives micro-batch matrix + splits"""
     if DEBUG:
         print(f"=" * 60)
-        print(f"STARTING ENHANCED INPUT WORKER RANK {rank}")
+        print(f"STARTING MICRO-BATCHING ENHANCED INPUT WORKER RANK {rank}")
         print(f"=" * 60)
     
     try:
@@ -143,20 +143,21 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         
         debug_print("✓ Ready for processing!", rank)
         debug_print(f"Will send processed data to activation node (rank {activation_rank})", rank)
-        debug_print("ENHANCEMENT: Expecting image index + vector split for proper synchronization", rank)
+        debug_print("MICRO-BATCHING: Expecting micro-batch size + micro-batch ID + matrix split", rank)
         debug_print("Entering main processing loop...", rank)
         
         if DEBUG:
             print(f"-" * 60)
         
         # Processing statistics
-        total_processed = 0
+        total_processed_microbatches = 0
+        total_processed_images = 0
         start_time = time.time()
         last_report_time = start_time
         
-        # ENHANCED: Track processed images for debugging
-        processed_images = set()
-        last_image_index = 0
+        # MICRO-BATCHING: Track processed micro-batches for debugging
+        processed_microbatches = set()
+        last_microbatch_id = 0
         out_of_order_count = 0
         
         # Generate random weight matrix for this input worker (based on rank for reproducibility)
@@ -168,69 +169,95 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         
         weight_matrix = torch.randn(100, expected_split_size)  # 100 x expected_split_size
         debug_print(f"Generated weight matrix: {weight_matrix.shape} for expected split size {expected_split_size}", rank)
+        debug_print("MICRO-BATCHING: Ready to process matrix operations on micro-batches", rank)
         
         # Worker processing loop
         while True:
             try:
-                # ENHANCED: Receive image index first
-                image_index_tensor = torch.zeros(1, dtype=torch.long)
-                dist.recv(image_index_tensor, src=0)
-                image_index = image_index_tensor.item()
+                # MICRO-BATCHING ENHANCED: Receive micro-batch size first
+                microbatch_size_tensor = torch.zeros(1, dtype=torch.long)
+                dist.recv(microbatch_size_tensor, src=0)
+                microbatch_size = microbatch_size_tensor.item()
                 
-                # Check for shutdown signal (special image index -999)
-                if image_index == -999:
+                # Check for shutdown signal (special micro-batch size -999)
+                if microbatch_size == -999:
                     debug_print("🛑 Received shutdown signal", rank)
                     break
                 
-                # ENHANCED: Receive the vector split
-                vector_split = torch.zeros(expected_split_size)  # Fixed size reception
-                dist.recv(vector_split, src=0)
+                # MICRO-BATCHING: Receive micro-batch ID
+                microbatch_id_tensor = torch.zeros(1, dtype=torch.long)
+                dist.recv(microbatch_id_tensor, src=0)
+                microbatch_id = microbatch_id_tensor.item()
+                
+                # MICRO-BATCHING: Receive the flattened micro-batch split
+                # Expected shape after reshape: (microbatch_size, expected_split_size)
+                total_elements = microbatch_size * expected_split_size
+                microbatch_split_flat = torch.zeros(total_elements)
+                dist.recv(microbatch_split_flat, src=0)
+                
+                # Reshape to matrix form: (microbatch_size, expected_split_size)
+                microbatch_split = microbatch_split_flat.view(microbatch_size, expected_split_size)
                 
                 # Check for additional shutdown patterns
-                if torch.all(vector_split == -999.0):  # Backup shutdown signal pattern
+                if torch.all(microbatch_split == -999.0):  # Backup shutdown signal pattern
                     debug_print("🛑 Received backup shutdown signal", rank)
                     break
-                elif torch.all(vector_split == 0.0):  # Potential heartbeat
+                elif torch.all(microbatch_split == 0.0):  # Potential heartbeat
                     debug_print("💓 Received potential heartbeat", rank)
                     continue
                 
-                # ENHANCED: Track image processing order
-                if image_index in processed_images:
-                    debug_print(f"⚠️  Duplicate image index {image_index} received!", rank)
+                # MICRO-BATCHING: Track micro-batch processing order
+                if microbatch_id in processed_microbatches:
+                    debug_print(f"⚠️  Duplicate micro-batch ID {microbatch_id} received!", rank)
                 else:
-                    processed_images.add(image_index)
+                    processed_microbatches.add(microbatch_id)
                 
                 # Check for out-of-order processing
-                if image_index < last_image_index:
+                if microbatch_id < last_microbatch_id:
                     out_of_order_count += 1
                     if DEBUG and out_of_order_count <= 5:  # Only log first few out-of-order events
-                        debug_print(f"📋 Out-of-order processing: received {image_index} after {last_image_index}", rank)
+                        debug_print(f"📋 Out-of-order processing: received micro-batch {microbatch_id} after {last_microbatch_id}", rank)
                 
-                last_image_index = max(last_image_index, image_index)
+                last_microbatch_id = max(last_microbatch_id, microbatch_id)
                 
-                # Process the vector split with weight matrix
-                # Apply weight matrix: (100, split_size) @ (split_size,) = (100,)
-                weighted_result = torch.mv(weight_matrix, vector_split)
+                # MICRO-BATCHING: Process the micro-batch matrix with weight matrix
+                # Matrix multiplication: (microbatch_size, expected_split_size) @ (expected_split_size, 100) = (microbatch_size, 100)
+                # But our weight matrix is (100, expected_split_size), so we need: (microbatch_size, expected_split_size) @ (expected_split_size, 100)
+                # We transpose: weight_matrix.T is (expected_split_size, 100)
+                microbatch_start_time = time.time()
+                weighted_results = torch.mm(microbatch_split, weight_matrix.T)  # (microbatch_size, 100)
+                microbatch_processing_time = time.time() - microbatch_start_time
                 
-                # ENHANCED: Send image index + weighted result to activation node
-                image_index_tensor_out = torch.tensor([image_index], dtype=torch.long)
-                dist.send(image_index_tensor_out, dst=activation_rank)
-                dist.send(weighted_result, dst=activation_rank)
+                # MICRO-BATCHING ENHANCED: Send micro-batch size + micro-batch ID + weighted results to activation node
+                microbatch_size_tensor_out = torch.tensor([microbatch_size], dtype=torch.long)
+                microbatch_id_tensor_out = torch.tensor([microbatch_id], dtype=torch.long)
                 
-                total_processed += 1
+                dist.send(microbatch_size_tensor_out, dst=activation_rank)
+                dist.send(microbatch_id_tensor_out, dst=activation_rank)
+                dist.send(weighted_results.flatten(), dst=activation_rank)  # Flatten for transmission
                 
-                # Report progress every 50 operations or every 10 seconds
+                total_processed_microbatches += 1
+                total_processed_images += microbatch_size
+                
+                # Report progress every 50 micro-batches or every 10 seconds
                 current_time = time.time()
-                if DEBUG and ((total_processed % 50 == 0) or (current_time - last_report_time > 10)):
+                if DEBUG and ((total_processed_microbatches % 50 == 0) or (current_time - last_report_time > 10)):
                     elapsed = current_time - start_time
-                    rate = total_processed / elapsed if elapsed > 0 else 0
-                    unique_images = len(processed_images)
-                    print(f"[InputWorker {rank}] Processed {total_processed} splits | Unique images: {unique_images} | Rate: {rate:.2f}/sec | Out-of-order: {out_of_order_count} | ENHANCED")
+                    microbatch_rate = total_processed_microbatches / elapsed if elapsed > 0 else 0
+                    image_rate = total_processed_images / elapsed if elapsed > 0 else 0
+                    unique_microbatches = len(processed_microbatches)
+                    print(f"[InputWorker {rank}] Processed {total_processed_microbatches} micro-batches ({total_processed_images} images) | MBatch rate: {microbatch_rate:.2f}/sec | Image rate: {image_rate:.2f}/sec | Unique: {unique_microbatches} | Out-of-order: {out_of_order_count} | MICRO-BATCHING")
                     last_report_time = current_time
                 
-                # Detailed logging for first few images
-                if DEBUG and total_processed <= 5:
-                    debug_print(f"Processed image {image_index}: split_size={expected_split_size}, weighted_sum={torch.sum(weighted_result).item():.4f}", rank)
+                # Detailed logging for first few micro-batches
+                if DEBUG and total_processed_microbatches <= 3:
+                    debug_print(f"Processed micro-batch {microbatch_id}:", rank)
+                    debug_print(f"  Size: {microbatch_size} images", rank)
+                    debug_print(f"  Input shape: {microbatch_split.shape}", rank)
+                    debug_print(f"  Output shape: {weighted_results.shape}", rank)
+                    debug_print(f"  Processing time: {microbatch_processing_time:.4f}s", rank)
+                    debug_print(f"  Weighted sum: {torch.sum(weighted_results).item():.4f}", rank)
+                    debug_print(f"  MICRO-BATCHING: Processed {microbatch_size} images in single operation", rank)
                 
             except RuntimeError as e:
                 error_msg = str(e).lower()
@@ -251,24 +278,29 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         # Final statistics
         final_time = time.time()
         total_elapsed = final_time - start_time
-        avg_rate = total_processed / total_elapsed if total_elapsed > 0 else 0
-        unique_images = len(processed_images)
+        avg_microbatch_rate = total_processed_microbatches / total_elapsed if total_elapsed > 0 else 0
+        avg_image_rate = total_processed_images / total_elapsed if total_elapsed > 0 else 0
+        unique_microbatches = len(processed_microbatches)
         
         if DEBUG:
-            print(f"\n[InputWorker {rank}] 📊 ENHANCED FINAL STATISTICS:")
-            print(f"[InputWorker {rank}]   Total splits processed: {total_processed}")
-            print(f"[InputWorker {rank}]   Unique images processed: {unique_images}")
+            print(f"\n[InputWorker {rank}] 📊 MICRO-BATCHING ENHANCED FINAL STATISTICS:")
+            print(f"[InputWorker {rank}]   Total micro-batches processed: {total_processed_microbatches}")
+            print(f"[InputWorker {rank}]   Total images processed: {total_processed_images}")
+            print(f"[InputWorker {rank}]   Unique micro-batches processed: {unique_microbatches}")
             print(f"[InputWorker {rank}]   Out-of-order events: {out_of_order_count}")
             print(f"[InputWorker {rank}]   Total time: {total_elapsed:.2f}s")
-            print(f"[InputWorker {rank}]   Average rate: {avg_rate:.2f} splits/second")
-            print(f"[InputWorker {rank}]   ENHANCEMENT: Image indexing ensures proper synchronization")
+            print(f"[InputWorker {rank}]   Average micro-batch rate: {avg_microbatch_rate:.2f} micro-batches/second")
+            print(f"[InputWorker {rank}]   Average image rate: {avg_image_rate:.2f} images/second")
+            print(f"[InputWorker {rank}]   Average images per micro-batch: {total_processed_images/total_processed_microbatches:.1f}" if total_processed_microbatches > 0 else "")
+            print(f"[InputWorker {rank}]   MICRO-BATCHING: Communication events reduced significantly")
+            print(f"[InputWorker {rank}]   MICRO-BATCHING: Matrix operations provide computational efficiency")
             
-            # Show some processed image indices for verification
-            if processed_images:
-                sample_indices = sorted(list(processed_images))[:10]
-                print(f"[InputWorker {rank}]   Sample processed indices: {sample_indices}")
-                if len(processed_images) > 10:
-                    print(f"[InputWorker {rank}]   ... and {len(processed_images) - 10} more")
+            # Show some processed micro-batch IDs for verification
+            if processed_microbatches:
+                sample_microbatch_ids = sorted(list(processed_microbatches))[:10]
+                print(f"[InputWorker {rank}]   Sample processed micro-batch IDs: {sample_microbatch_ids}")
+                if len(processed_microbatches) > 10:
+                    print(f"[InputWorker {rank}]   ... and {len(processed_microbatches) - 10} more")
         
     except KeyboardInterrupt:
         debug_print("🛑 Interrupted by user", rank)
@@ -279,7 +311,7 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
             traceback.print_exc()
     finally:
         cleanup_distributed()
-        debug_print("👋 Enhanced input worker process terminated", rank)
+        debug_print("👋 Enhanced micro-batching input worker process terminated", rank)
 
 def get_local_ip():
     """Get the local IP address of this machine"""
@@ -296,14 +328,14 @@ def run_interactive_setup():
     """Interactive setup for worker configuration"""
     if DEBUG:
         print("=" * 60)
-        print("INTERACTIVE ENHANCED INPUT WORKER SETUP")
+        print("INTERACTIVE MICRO-BATCHING ENHANCED INPUT WORKER SETUP")
         print("=" * 60)
     
     # Get local IP for reference
     local_ip = get_local_ip()
     if DEBUG:
         print(f"Local machine IP: {local_ip}")
-        print("ENHANCEMENT: This worker uses image indexing for proper synchronization")
+        print("MICRO-BATCHING: This worker processes multiple images per communication event")
     
     # Get configuration from user
     try:
@@ -343,7 +375,7 @@ def run_interactive_setup():
         print(f"  World size: {world_size}")
         print(f"  Activation node rank: {activation_rank}")
         print(f"  Local IP: {local_ip}")
-        print(f"  ENHANCEMENT: Image indexing enabled")
+        print(f"  MICRO-BATCHING: Matrix-based operations enabled")
     
     confirm = input(f"\nProceed with this configuration? [y/N]: ").strip().lower()
     if confirm in ['y', 'yes']:
@@ -359,7 +391,7 @@ def main():
     # Set multiprocessing start method for compatibility
     mp.set_start_method('spawn', force=True)
     
-    parser = argparse.ArgumentParser(description='Enhanced Distributed Input Worker Node with Image Indexing')
+    parser = argparse.ArgumentParser(description='Micro-Batching Enhanced Distributed Input Worker Node')
     parser.add_argument('--rank', type=int, help='Input worker rank (1, 2, ...)')
     parser.add_argument('--world-size', type=int, default=4, help='Total world size including master and activation node')
     parser.add_argument('--master-addr', default='192.168.1.191', help='Master node IP address')
@@ -400,13 +432,13 @@ def main():
         return
     
     if DEBUG:
-        print(f"\n🚀 Starting enhanced input worker with configuration:")
+        print(f"\n🚀 Starting micro-batching enhanced input worker with configuration:")
         print(f"   Rank: {rank}")
         print(f"   World size: {world_size}")
         print(f"   Master: {master_addr}:{master_port}")
         print(f"   Activation node rank: {activation_rank}")
         print(f"   Debug mode: {DEBUG}")
-        print(f"   ENHANCEMENT: Image indexing for proper synchronization")
+        print(f"   MICRO-BATCHING: Matrix operations for computational efficiency")
     
     # Test connectivity before starting
     if DEBUG:
@@ -430,7 +462,7 @@ def main():
             pass
     
     try:
-        # Run the enhanced input worker
+        # Run the micro-batching enhanced input worker
         worker_process(rank, world_size, activation_rank, master_addr, master_port)
     except KeyboardInterrupt:
         debug_print("🛑 Input worker interrupted by user")
