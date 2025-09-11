@@ -1,4 +1,5 @@
-# ENHANCED INPUT LAYER NODE WITH MICRO-BATCHING
+# ENHANCED INPUT LAYER NODE WITH EBD2N MATHEMATICAL FRAMEWORK
+# Adapted to integrate with existing distributed micro-batching framework
 
 import torch
 import torch.distributed as dist
@@ -10,6 +11,8 @@ from datetime import timedelta
 import sys
 import signal
 import argparse
+import math
+from typing import List, Dict, Any, Optional
 
 # Global debug flag
 DEBUG = True
@@ -18,9 +21,137 @@ def debug_print(message, rank=None):
     """Print debug messages only if DEBUG is True"""
     if DEBUG:
         if rank is not None:
-            print(f"[InputWorker {rank}] {message}")
+            print(f"[EBD2N-InputWorker {rank}] {message}")
         else:
-            print(f"[InputWorker] {message}")
+            print(f"[EBD2N-InputWorker] {message}")
+
+class EBD2NInputPartition:
+    """
+    EBD2N Input Layer Partition following mathematical framework.
+    
+    Mathematical specification:
+    - Weight matrix: W_i^[0] ∈ R^{d^[1] × s^[0]}
+    - Forward: z_i^[0] = W_i^[0] @ x_i^[0]
+    - Backward: ∇_{W_i^[0]} = δ^[1] ⊗ x_i^[0] (outer product)
+    """
+    
+    def __init__(self, partition_id: int, input_partition_size: int, output_size: int, device: torch.device = torch.device('cpu')):
+        """
+        Initialize EBD2N input partition.
+        
+        Args:
+            partition_id: Partition index (0-based)
+            input_partition_size: s^[0] = d^[0] / p^[0]
+            output_size: d^[1] (activation layer size)
+            device: Computation device
+        """
+        self.partition_id = partition_id
+        self.s_0 = input_partition_size  # s^[0]
+        self.d_1 = output_size          # d^[1]
+        self.device = device
+        
+        # Initialize weight matrix W_i^[0] ∈ R^{d^[1] × s^[0]} using Xavier initialization
+        self.W = self._initialize_weights()
+        
+        # Statistics tracking
+        self.forward_calls = 0
+        self.total_examples_processed = 0
+        self.weight_updates = 0
+        
+        # For future backpropagation support
+        self.accumulated_gradients = torch.zeros_like(self.W)
+        self.gradient_accumulation_count = 0
+        
+        debug_print(f"Initialized EBD2N partition {partition_id}: W shape {self.W.shape}")
+    
+    def _initialize_weights(self) -> torch.Tensor:
+        """Initialize weight matrix using Xavier/Glorot initialization."""
+        fan_in = self.s_0
+        fan_out = self.d_1
+        std = math.sqrt(2.0 / (fan_in + fan_out))
+        
+        W = torch.randn(self.d_1, self.s_0, device=self.device, dtype=torch.float32) * std
+        return W
+    
+    def forward(self, x_partition: torch.Tensor) -> torch.Tensor:
+        """
+        EBD2N forward pass: z_i^[0] = W_i^[0] @ x_i^[0]
+        
+        Args:
+            x_partition: Input partition ∈ R^{m × s^[0]} for micro-batch
+            
+        Returns:
+            z_i^[0]: Output ∈ R^{m × d^[1]}
+        """
+        # Validate input dimensions
+        assert x_partition.dim() == 2, f"Expected 2D input (micro-batch), got {x_partition.dim()}D"
+        assert x_partition.shape[1] == self.s_0, f"Input partition size mismatch: expected {self.s_0}, got {x_partition.shape[1]}"
+        
+        # Matrix multiplication: (m × s^[0]) @ (s^[0] × d^[1]) = (m × d^[1])
+        # Note: W is (d^[1] × s^[0]), so we need W.T which is (s^[0] × d^[1])
+        z = torch.mm(x_partition, self.W.T)
+        
+        self.forward_calls += 1
+        self.total_examples_processed += x_partition.shape[0]
+        
+        return z
+    
+    def accumulate_gradients(self, x_partition: torch.Tensor, error_signal: torch.Tensor):
+        """
+        Accumulate gradients for future backpropagation.
+        
+        Mathematical operation: ∇_{W_i^[0]} += δ^[1] ⊗ x_i^[0]
+        
+        Args:
+            x_partition: Input partition used in forward pass
+            error_signal: Error signal δ^[1] from activation layer
+        """
+        # For micro-batch, accumulate gradients across all examples
+        for i in range(x_partition.shape[0]):
+            x_example = x_partition[i]  # Single example: s^[0]
+            delta_example = error_signal[i] if error_signal.dim() > 1 else error_signal  # d^[1]
+            
+            # Outer product: δ^[1] ⊗ x_i^[0] → (d^[1], s^[0])
+            gradient = torch.outer(delta_example, x_example)
+            self.accumulated_gradients += gradient
+            self.gradient_accumulation_count += 1
+    
+    def update_weights(self, learning_rate: float = 0.01, l2_regularization: float = 0.0):
+        """
+        Update weights using accumulated gradients.
+        
+        Mathematical operations:
+        - Standard: W_i^[0] ← W_i^[0] - η * (∇_{W_i^[0]} / count)
+        - With L2: W_i^[0] ← (1 - η*λ) * W_i^[0] - η * (∇_{W_i^[0]} / count)
+        """
+        if self.gradient_accumulation_count > 0:
+            # Average gradients
+            avg_gradient = self.accumulated_gradients / self.gradient_accumulation_count
+            
+            # Apply weight update
+            if l2_regularization > 0.0:
+                self.W = (1.0 - learning_rate * l2_regularization) * self.W - learning_rate * avg_gradient
+            else:
+                self.W = self.W - learning_rate * avg_gradient
+            
+            # Reset accumulation
+            self.accumulated_gradients.zero_()
+            self.gradient_accumulation_count = 0
+            self.weight_updates += 1
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get partition statistics."""
+        return {
+            'partition_id': self.partition_id,
+            'weight_shape': list(self.W.shape),
+            'weight_norm': torch.norm(self.W).item(),
+            'weight_mean': torch.mean(self.W).item(),
+            'weight_std': torch.std(self.W).item(),
+            'forward_calls': self.forward_calls,
+            'total_examples_processed': self.total_examples_processed,
+            'weight_updates': self.weight_updates,
+            'pending_gradients': self.gradient_accumulation_count
+        }
 
 def test_network_connectivity(master_addr, master_port, timeout=10):
     """Test if we can connect to the master node"""
@@ -61,11 +192,11 @@ def setup_distributed(rank, world_size, master_addr="192.168.1.191", master_port
     os.environ['MASTER_PORT'] = master_port
     
     if DEBUG:
-        print(f"[InputWorker {rank}] Setting up distributed training:")
-        print(f"[InputWorker {rank}]   Rank: {rank}")
-        print(f"[InputWorker {rank}]   World size: {world_size}")
-        print(f"[InputWorker {rank}]   Master addr: {master_addr}")
-        print(f"[InputWorker {rank}]   Master port: {master_port}")
+        print(f"[EBD2N-InputWorker {rank}] Setting up distributed training:")
+        print(f"[EBD2N-InputWorker {rank}]   Rank: {rank}")
+        print(f"[EBD2N-InputWorker {rank}]   World size: {world_size}")
+        print(f"[EBD2N-InputWorker {rank}]   Master addr: {master_addr}")
+        print(f"[EBD2N-InputWorker {rank}]   Master port: {master_port}")
     
     # Wait for master to be available
     if not wait_for_master(master_addr, master_port):
@@ -102,22 +233,22 @@ def setup_distributed(rank, world_size, master_addr="192.168.1.191", master_port
                 
     except Exception as e:
         if DEBUG:
-            print(f"\n[InputWorker {rank}] ❌ FAILED TO INITIALIZE DISTRIBUTED TRAINING:")
-            print(f"[InputWorker {rank}] Error: {e}")
+            print(f"\n[EBD2N-InputWorker {rank}] ❌ FAILED TO INITIALIZE DISTRIBUTED TRAINING:")
+            print(f"[EBD2N-InputWorker {rank}] Error: {e}")
             print_troubleshooting_tips(rank, master_addr, master_port)
         raise
 
 def print_troubleshooting_tips(rank, master_addr, master_port):
     """Print comprehensive troubleshooting information"""
     if DEBUG:
-        print(f"\n[InputWorker {rank}] TROUBLESHOOTING CHECKLIST:")
-        print(f"[InputWorker {rank}] 1. Is the master node running?")
-        print(f"[InputWorker {rank}] 2. Can you ping {master_addr}?")
-        print(f"[InputWorker {rank}] 3. Is port {master_port} open in firewall?")
-        print(f"[InputWorker {rank}] 4. Try: telnet {master_addr} {master_port}")
-        print(f"[InputWorker {rank}] 5. Are you on the same network as master?")
-        print(f"[InputWorker {rank}] 6. Check if master changed to a different port")
-        print(f"[InputWorker {rank}] 7. Ensure master started before workers")
+        print(f"\n[EBD2N-InputWorker {rank}] TROUBLESHOOTING CHECKLIST:")
+        print(f"[EBD2N-InputWorker {rank}] 1. Is the master node running?")
+        print(f"[EBD2N-InputWorker {rank}] 2. Can you ping {master_addr}?")
+        print(f"[EBD2N-InputWorker {rank}] 3. Is port {master_port} open in firewall?")
+        print(f"[EBD2N-InputWorker {rank}] 4. Try: telnet {master_addr} {master_port}")
+        print(f"[EBD2N-InputWorker {rank}] 5. Are you on the same network as master?")
+        print(f"[EBD2N-InputWorker {rank}] 6. Check if master changed to a different port")
+        print(f"[EBD2N-InputWorker {rank}] 7. Ensure master started before workers")
 
 def cleanup_distributed():
     """Clean up distributed training"""
@@ -129,21 +260,44 @@ def cleanup_distributed():
             pass
 
 def worker_process(rank, world_size, activation_rank, master_addr, master_port):
-    """MICRO-BATCHING ENHANCED input worker process - receives micro-batch matrix + splits"""
+    """EBD2N ENHANCED input worker process with mathematical framework compliance"""
     if DEBUG:
         print(f"=" * 60)
-        print(f"STARTING MICRO-BATCHING ENHANCED INPUT WORKER RANK {rank}")
+        print(f"STARTING EBD2N ENHANCED INPUT WORKER RANK {rank}")
         print(f"=" * 60)
     
     try:
-        debug_print("Initializing...", rank)
+        debug_print("Initializing EBD2N framework...", rank)
         
         # Setup distributed environment
         setup_distributed(rank, world_size, master_addr, master_port)
         
-        debug_print("✓ Ready for processing!", rank)
+        # Calculate EBD2N partition configuration
+        num_input_workers = world_size - 2  # Exclude master and activation node
+        partition_id = rank - 1  # Convert rank to 0-based partition index
+        
+        # EBD2N configuration
+        input_size = 784  # d^[0] - MNIST image size
+        output_size = 100  # d^[1] - activation layer size
+        
+        # Verify divisibility constraint: d^[0] mod p^[0] = 0
+        if input_size % num_input_workers != 0:
+            raise ValueError(f"EBD2N constraint violation: input size {input_size} must be divisible by number of partitions {num_input_workers}")
+        
+        partition_size = input_size // num_input_workers  # s^[0]
+        
+        # Create EBD2N input partition
+        ebd2n_partition = EBD2NInputPartition(
+            partition_id=partition_id,
+            input_partition_size=partition_size,
+            output_size=output_size
+        )
+        
+        debug_print("✓ EBD2N partition initialized!", rank)
+        debug_print(f"Partition ID: {partition_id}, Input size: {partition_size}, Output size: {output_size}", rank)
+        debug_print(f"Weight matrix shape: {ebd2n_partition.W.shape}", rank)
         debug_print(f"Will send processed data to activation node (rank {activation_rank})", rank)
-        debug_print("MICRO-BATCHING: Expecting micro-batch size + micro-batch ID + matrix split", rank)
+        debug_print("EBD2N: Following mathematical framework for vertical partitioning", rank)
         debug_print("Entering main processing loop...", rank)
         
         if DEBUG:
@@ -155,26 +309,17 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         start_time = time.time()
         last_report_time = start_time
         
-        # MICRO-BATCHING: Track processed micro-batches for debugging
+        # EBD2N: Track processed micro-batches for debugging
         processed_microbatches = set()
         last_microbatch_id = 0
         out_of_order_count = 0
         
-        # Generate random weight matrix for this input worker (based on rank for reproducibility)
-        torch.manual_seed(rank * 42)  # Different seed for each worker
-        
-        # Calculate expected split size (784 / number of input workers)
-        num_input_workers = world_size - 2  # Exclude master and activation node
-        expected_split_size = 784 // num_input_workers
-        
-        weight_matrix = torch.randn(100, expected_split_size)  # 100 x expected_split_size
-        debug_print(f"Generated weight matrix: {weight_matrix.shape} for expected split size {expected_split_size}", rank)
-        debug_print("MICRO-BATCHING: Ready to process matrix operations on micro-batches", rank)
+        debug_print("EBD2N: Ready to process matrix operations on micro-batches", rank)
         
         # Worker processing loop
         while True:
             try:
-                # MICRO-BATCHING ENHANCED: Receive micro-batch size first
+                # EBD2N ENHANCED: Receive micro-batch size first
                 microbatch_size_tensor = torch.zeros(1, dtype=torch.long)
                 dist.recv(microbatch_size_tensor, src=0)
                 microbatch_size = microbatch_size_tensor.item()
@@ -184,19 +329,19 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
                     debug_print("🛑 Received shutdown signal", rank)
                     break
                 
-                # MICRO-BATCHING: Receive micro-batch ID
+                # EBD2N: Receive micro-batch ID
                 microbatch_id_tensor = torch.zeros(1, dtype=torch.long)
                 dist.recv(microbatch_id_tensor, src=0)
                 microbatch_id = microbatch_id_tensor.item()
                 
-                # MICRO-BATCHING: Receive the flattened micro-batch split
-                # Expected shape after reshape: (microbatch_size, expected_split_size)
-                total_elements = microbatch_size * expected_split_size
+                # EBD2N: Receive the flattened micro-batch split
+                # Expected shape after reshape: (microbatch_size, partition_size)
+                total_elements = microbatch_size * partition_size
                 microbatch_split_flat = torch.zeros(total_elements)
                 dist.recv(microbatch_split_flat, src=0)
                 
-                # Reshape to matrix form: (microbatch_size, expected_split_size)
-                microbatch_split = microbatch_split_flat.view(microbatch_size, expected_split_size)
+                # Reshape to matrix form: (microbatch_size, partition_size)
+                microbatch_split = microbatch_split_flat.view(microbatch_size, partition_size)
                 
                 # Check for additional shutdown patterns
                 if torch.all(microbatch_split == -999.0):  # Backup shutdown signal pattern
@@ -206,7 +351,7 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
                     debug_print("💓 Received potential heartbeat", rank)
                     continue
                 
-                # MICRO-BATCHING: Track micro-batch processing order
+                # EBD2N: Track micro-batch processing order
                 if microbatch_id in processed_microbatches:
                     debug_print(f"⚠️  Duplicate micro-batch ID {microbatch_id} received!", rank)
                 else:
@@ -220,15 +365,13 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
                 
                 last_microbatch_id = max(last_microbatch_id, microbatch_id)
                 
-                # MICRO-BATCHING: Process the micro-batch matrix with weight matrix
-                # Matrix multiplication: (microbatch_size, expected_split_size) @ (expected_split_size, 100) = (microbatch_size, 100)
-                # But our weight matrix is (100, expected_split_size), so we need: (microbatch_size, expected_split_size) @ (expected_split_size, 100)
-                # We transpose: weight_matrix.T is (expected_split_size, 100)
+                # EBD2N MATHEMATICAL FRAMEWORK: Process the micro-batch matrix
+                # Forward pass: z_i^[0] = W_i^[0] @ x_i^[0]
                 microbatch_start_time = time.time()
-                weighted_results = torch.mm(microbatch_split, weight_matrix.T)  # (microbatch_size, 100)
+                weighted_results = ebd2n_partition.forward(microbatch_split)
                 microbatch_processing_time = time.time() - microbatch_start_time
                 
-                # MICRO-BATCHING ENHANCED: Send micro-batch size + micro-batch ID + weighted results to activation node
+                # EBD2N ENHANCED: Send micro-batch size + micro-batch ID + weighted results to activation node
                 microbatch_size_tensor_out = torch.tensor([microbatch_size], dtype=torch.long)
                 microbatch_id_tensor_out = torch.tensor([microbatch_id], dtype=torch.long)
                 
@@ -246,18 +389,24 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
                     microbatch_rate = total_processed_microbatches / elapsed if elapsed > 0 else 0
                     image_rate = total_processed_images / elapsed if elapsed > 0 else 0
                     unique_microbatches = len(processed_microbatches)
-                    print(f"[InputWorker {rank}] Processed {total_processed_microbatches} micro-batches ({total_processed_images} images) | MBatch rate: {microbatch_rate:.2f}/sec | Image rate: {image_rate:.2f}/sec | Unique: {unique_microbatches} | Out-of-order: {out_of_order_count} | MICRO-BATCHING")
+                    print(f"[EBD2N-InputWorker {rank}] Processed {total_processed_microbatches} micro-batches ({total_processed_images} images) | MBatch rate: {microbatch_rate:.2f}/sec | Image rate: {image_rate:.2f}/sec | Unique: {unique_microbatches} | Out-of-order: {out_of_order_count} | EBD2N-COMPLIANT")
                     last_report_time = current_time
                 
                 # Detailed logging for first few micro-batches
                 if DEBUG and total_processed_microbatches <= 3:
-                    debug_print(f"Processed micro-batch {microbatch_id}:", rank)
+                    debug_print(f"EBD2N processed micro-batch {microbatch_id}:", rank)
                     debug_print(f"  Size: {microbatch_size} images", rank)
                     debug_print(f"  Input shape: {microbatch_split.shape}", rank)
                     debug_print(f"  Output shape: {weighted_results.shape}", rank)
                     debug_print(f"  Processing time: {microbatch_processing_time:.4f}s", rank)
                     debug_print(f"  Weighted sum: {torch.sum(weighted_results).item():.4f}", rank)
-                    debug_print(f"  MICRO-BATCHING: Processed {microbatch_size} images in single operation", rank)
+                    debug_print(f"  Weight matrix norm: {torch.norm(ebd2n_partition.W).item():.4f}", rank)
+                    debug_print(f"  EBD2N: Mathematical framework z_i^[0] = W_i^[0] @ x_i^[0]", rank)
+                
+                # TODO: Future backpropagation integration point
+                # When activation layer implements backprop, it will send error signals back
+                # Then we would call: ebd2n_partition.accumulate_gradients(microbatch_split, error_signal)
+                # And periodically: ebd2n_partition.update_weights(learning_rate=0.01)
                 
             except RuntimeError as e:
                 error_msg = str(e).lower()
@@ -266,11 +415,11 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
                     break
                 else:
                     if DEBUG:
-                        print(f"[InputWorker {rank}] ❌ Runtime error: {e}")
+                        print(f"[EBD2N-InputWorker {rank}] ❌ Runtime error: {e}")
                     raise
             except Exception as e:
                 if DEBUG:
-                    print(f"[InputWorker {rank}] ❌ Unexpected error: {e}")
+                    print(f"[EBD2N-InputWorker {rank}] ❌ Unexpected error: {e}")
                     import traceback
                     traceback.print_exc()
                 break
@@ -282,36 +431,43 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         avg_image_rate = total_processed_images / total_elapsed if total_elapsed > 0 else 0
         unique_microbatches = len(processed_microbatches)
         
+        # Get EBD2N partition statistics
+        ebd2n_stats = ebd2n_partition.get_statistics()
+        
         if DEBUG:
-            print(f"\n[InputWorker {rank}] 📊 MICRO-BATCHING ENHANCED FINAL STATISTICS:")
-            print(f"[InputWorker {rank}]   Total micro-batches processed: {total_processed_microbatches}")
-            print(f"[InputWorker {rank}]   Total images processed: {total_processed_images}")
-            print(f"[InputWorker {rank}]   Unique micro-batches processed: {unique_microbatches}")
-            print(f"[InputWorker {rank}]   Out-of-order events: {out_of_order_count}")
-            print(f"[InputWorker {rank}]   Total time: {total_elapsed:.2f}s")
-            print(f"[InputWorker {rank}]   Average micro-batch rate: {avg_microbatch_rate:.2f} micro-batches/second")
-            print(f"[InputWorker {rank}]   Average image rate: {avg_image_rate:.2f} images/second")
-            print(f"[InputWorker {rank}]   Average images per micro-batch: {total_processed_images/total_processed_microbatches:.1f}" if total_processed_microbatches > 0 else "")
-            print(f"[InputWorker {rank}]   MICRO-BATCHING: Communication events reduced significantly")
-            print(f"[InputWorker {rank}]   MICRO-BATCHING: Matrix operations provide computational efficiency")
+            print(f"\n[EBD2N-InputWorker {rank}] 📊 EBD2N FINAL STATISTICS:")
+            print(f"[EBD2N-InputWorker {rank}]   Total micro-batches processed: {total_processed_microbatches}")
+            print(f"[EBD2N-InputWorker {rank}]   Total images processed: {total_processed_images}")
+            print(f"[EBD2N-InputWorker {rank}]   Unique micro-batches processed: {unique_microbatches}")
+            print(f"[EBD2N-InputWorker {rank}]   Out-of-order events: {out_of_order_count}")
+            print(f"[EBD2N-InputWorker {rank}]   Total time: {total_elapsed:.2f}s")
+            print(f"[EBD2N-InputWorker {rank}]   Average micro-batch rate: {avg_microbatch_rate:.2f} micro-batches/second")
+            print(f"[EBD2N-InputWorker {rank}]   Average image rate: {avg_image_rate:.2f} images/second")
+            print(f"[EBD2N-InputWorker {rank}]   Average images per micro-batch: {total_processed_images/total_processed_microbatches:.1f}" if total_processed_microbatches > 0 else "")
+            print(f"[EBD2N-InputWorker {rank}]   EBD2N: Mathematical framework compliance verified")
+            print(f"[EBD2N-InputWorker {rank}]   EBD2N: Weight matrix shape: {ebd2n_stats['weight_shape']}")
+            print(f"[EBD2N-InputWorker {rank}]   EBD2N: Weight matrix norm: {ebd2n_stats['weight_norm']:.4f}")
+            print(f"[EBD2N-InputWorker {rank}]   EBD2N: Forward calls: {ebd2n_stats['forward_calls']}")
+            print(f"[EBD2N-InputWorker {rank}]   EBD2N: Examples processed by partition: {ebd2n_stats['total_examples_processed']}")
+            print(f"[EBD2N-InputWorker {rank}]   EBD2N: Ready for backpropagation integration")
             
             # Show some processed micro-batch IDs for verification
             if processed_microbatches:
                 sample_microbatch_ids = sorted(list(processed_microbatches))[:10]
-                print(f"[InputWorker {rank}]   Sample processed micro-batch IDs: {sample_microbatch_ids}")
+                print(f"[EBD2N-InputWorker {rank}]   Sample processed micro-batch IDs: {sample_microbatch_ids}")
                 if len(processed_microbatches) > 10:
-                    print(f"[InputWorker {rank}]   ... and {len(processed_microbatches) - 10} more")
+                    print(f"[EBD2N-InputWorker {rank}]   ... and {len(processed_microbatches) - 10} more")
         
     except KeyboardInterrupt:
         debug_print("🛑 Interrupted by user", rank)
     except Exception as e:
         if DEBUG:
-            print(f"\n[InputWorker {rank}] ❌ Failed to start or run: {e}")
+            print(f"\n[EBD2N-InputWorker {rank}] ❌ Failed to start or run: {e}")
             import traceback
             traceback.print_exc()
     finally:
         cleanup_distributed()
-        debug_print("👋 Enhanced micro-batching input worker process terminated", rank)
+        debug_print("👋 EBD2N enhanced input worker process terminated", rank)
 
 def get_local_ip():
     """Get the local IP address of this machine"""
@@ -328,14 +484,14 @@ def run_interactive_setup():
     """Interactive setup for worker configuration"""
     if DEBUG:
         print("=" * 60)
-        print("INTERACTIVE MICRO-BATCHING ENHANCED INPUT WORKER SETUP")
+        print("INTERACTIVE EBD2N ENHANCED INPUT WORKER SETUP")
         print("=" * 60)
     
     # Get local IP for reference
     local_ip = get_local_ip()
     if DEBUG:
         print(f"Local machine IP: {local_ip}")
-        print("MICRO-BATCHING: This worker processes multiple images per communication event")
+        print("EBD2N: This worker implements mathematical framework compliance")
     
     # Get configuration from user
     try:
@@ -368,14 +524,32 @@ def run_interactive_setup():
     # Calculate activation rank (last worker rank)
     activation_rank = world_size - 1
     
+    # Verify EBD2N constraints
+    num_input_workers = world_size - 2
+    input_size = 784
+    if input_size % num_input_workers != 0:
+        print(f"WARNING: EBD2N constraint violation!")
+        print(f"Input size {input_size} must be divisible by number of input workers {num_input_workers}")
+        print(f"Consider using a different world size where {input_size} % {num_input_workers} = 0")
+        
+        common_divisors = [i for i in range(2, 20) if 784 % i == 0]
+        suggested_world_sizes = [d + 2 for d in common_divisors]  # +2 for master and activation
+        print(f"Suggested world sizes: {suggested_world_sizes}")
+        
+        proceed = input("Continue anyway? [y/N]: ").strip().lower()
+        if proceed not in ['y', 'yes']:
+            return None
+    
     if DEBUG:
-        print(f"\nConfiguration:")
+        print(f"\nEBD2N Configuration:")
         print(f"  Input worker rank: {rank}")
         print(f"  Master: {master_addr}:{master_port}")
         print(f"  World size: {world_size}")
         print(f"  Activation node rank: {activation_rank}")
+        print(f"  Number of input workers: {num_input_workers}")
+        print(f"  Partition size per worker: {input_size // num_input_workers}")
         print(f"  Local IP: {local_ip}")
-        print(f"  MICRO-BATCHING: Matrix-based operations enabled")
+        print(f"  EBD2N: Mathematical framework enabled")
     
     confirm = input(f"\nProceed with this configuration? [y/N]: ").strip().lower()
     if confirm in ['y', 'yes']:
@@ -391,7 +565,7 @@ def main():
     # Set multiprocessing start method for compatibility
     mp.set_start_method('spawn', force=True)
     
-    parser = argparse.ArgumentParser(description='Micro-Batching Enhanced Distributed Input Worker Node')
+    parser = argparse.ArgumentParser(description='EBD2N Enhanced Distributed Input Worker Node')
     parser.add_argument('--rank', type=int, help='Input worker rank (1, 2, ...)')
     parser.add_argument('--world-size', type=int, default=4, help='Total world size including master and activation node')
     parser.add_argument('--master-addr', default='192.168.1.191', help='Master node IP address')
@@ -431,14 +605,23 @@ def main():
         print(f"Error: Input worker rank must be >= 1 (rank 0 is reserved for master)")
         return
     
+    # Validate EBD2N constraints
+    num_input_workers = world_size - 2
+    input_size = 784
+    if input_size % num_input_workers != 0:
+        print(f"Error: EBD2N constraint violation!")
+        print(f"Input size {input_size} must be divisible by number of input workers {num_input_workers}")
+        return
+    
     if DEBUG:
-        print(f"\n🚀 Starting micro-batching enhanced input worker with configuration:")
+        print(f"\n🚀 Starting EBD2N enhanced input worker with configuration:")
         print(f"   Rank: {rank}")
         print(f"   World size: {world_size}")
         print(f"   Master: {master_addr}:{master_port}")
         print(f"   Activation node rank: {activation_rank}")
         print(f"   Debug mode: {DEBUG}")
-        print(f"   MICRO-BATCHING: Matrix operations for computational efficiency")
+        print(f"   EBD2N: Mathematical framework compliance enabled")
+        print(f"   EBD2N: Partition size: {input_size // num_input_workers}")
     
     # Test connectivity before starting
     if DEBUG:
@@ -462,7 +645,7 @@ def main():
             pass
     
     try:
-        # Run the micro-batching enhanced input worker
+        # Run the EBD2N enhanced input worker
         worker_process(rank, world_size, activation_rank, master_addr, master_port)
     except KeyboardInterrupt:
         debug_print("🛑 Input worker interrupted by user")
