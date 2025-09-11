@@ -138,7 +138,7 @@ def create_master_engine(world_size, splits, batch_size, micro_batch_size, activ
     
     # Store dataset globally to avoid reloading
     transform = transforms.ToTensor()
-    dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
     data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
     data_iter = iter(data_loader)
     
