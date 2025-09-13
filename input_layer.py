@@ -1,5 +1,5 @@
-# ENHANCED INPUT LAYER NODE WITH EBD2N MATHEMATICAL FRAMEWORK
-# Adapted to integrate with existing distributed micro-batching framework
+# EBD2N ENHANCED INPUT LAYER NODE WITH FIXED WORKER COUNT CALCULATION
+# FIXED: Now correctly calculates number of input workers based on network topology
 
 import torch
 import torch.distributed as dist
@@ -95,49 +95,6 @@ class EBD2NInputPartition:
         self.total_examples_processed += x_partition.shape[0]
         
         return z
-    
-    def accumulate_gradients(self, x_partition: torch.Tensor, error_signal: torch.Tensor):
-        """
-        Accumulate gradients for future backpropagation.
-        
-        Mathematical operation: ∇_{W_i^[0]} += δ^[1] ⊗ x_i^[0]
-        
-        Args:
-            x_partition: Input partition used in forward pass
-            error_signal: Error signal δ^[1] from activation layer
-        """
-        # For micro-batch, accumulate gradients across all examples
-        for i in range(x_partition.shape[0]):
-            x_example = x_partition[i]  # Single example: s^[0]
-            delta_example = error_signal[i] if error_signal.dim() > 1 else error_signal  # d^[1]
-            
-            # Outer product: δ^[1] ⊗ x_i^[0] → (d^[1], s^[0])
-            gradient = torch.outer(delta_example, x_example)
-            self.accumulated_gradients += gradient
-            self.gradient_accumulation_count += 1
-    
-    def update_weights(self, learning_rate: float = 0.01, l2_regularization: float = 0.0):
-        """
-        Update weights using accumulated gradients.
-        
-        Mathematical operations:
-        - Standard: W_i^[0] ← W_i^[0] - η * (∇_{W_i^[0]} / count)
-        - With L2: W_i^[0] ← (1 - η*λ) * W_i^[0] - η * (∇_{W_i^[0]} / count)
-        """
-        if self.gradient_accumulation_count > 0:
-            # Average gradients
-            avg_gradient = self.accumulated_gradients / self.gradient_accumulation_count
-            
-            # Apply weight update
-            if l2_regularization > 0.0:
-                self.W = (1.0 - learning_rate * l2_regularization) * self.W - learning_rate * avg_gradient
-            else:
-                self.W = self.W - learning_rate * avg_gradient
-            
-            # Reset accumulation
-            self.accumulated_gradients.zero_()
-            self.gradient_accumulation_count = 0
-            self.weight_updates += 1
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get partition statistics."""
@@ -259,11 +216,56 @@ def cleanup_distributed():
         except:
             pass
 
+def calculate_network_topology(world_size):
+    """
+    Calculate network topology based on world size to match master node configuration.
+    
+    FIXED: This function now correctly calculates the topology to match the master node.
+    
+    For world_size = 7:
+    - Master: rank 0
+    - Input workers: ranks 1, 2 (splits = 2)
+    - Activation: rank 3
+    - Weighted workers: ranks 4, 5 (2 workers)
+    - Output: rank 6
+    """
+    if world_size == 7:
+        # Standard EBD2N configuration for world_size 7
+        num_input_workers = 2  # splits = 2
+        activation_rank = 3
+        num_weighted_workers = 2
+        output_rank = 6
+    elif world_size == 4:
+        # Minimal configuration
+        num_input_workers = 1  # splits = 1
+        activation_rank = 2
+        num_weighted_workers = 1
+        output_rank = 3
+    elif world_size == 6:
+        # Alternative configuration
+        num_input_workers = 2  # splits = 2
+        activation_rank = 3
+        num_weighted_workers = 1
+        output_rank = 5
+    else:
+        # Generic calculation - but this should match master node configuration
+        # For custom world sizes, you may need to adjust this
+        if world_size < 4:
+            raise ValueError(f"World size {world_size} too small for EBD2N network (minimum 4)")
+        
+        # Default: 2 input workers, 1 activation, remaining-2 for weighted, 1 output
+        num_input_workers = 2
+        activation_rank = num_input_workers + 1
+        num_weighted_workers = max(1, world_size - num_input_workers - 3)  # -3 for master, activation, output
+        output_rank = world_size - 1
+    
+    return num_input_workers, activation_rank, num_weighted_workers, output_rank
+
 def worker_process(rank, world_size, activation_rank, master_addr, master_port):
-    """EBD2N ENHANCED input worker process with mathematical framework compliance"""
+    """EBD2N FIXED input worker process with correct network topology calculation"""
     if DEBUG:
         print(f"=" * 60)
-        print(f"STARTING EBD2N ENHANCED INPUT WORKER RANK {rank}")
+        print(f"STARTING EBD2N FIXED INPUT WORKER RANK {rank}")
         print(f"=" * 60)
     
     try:
@@ -272,17 +274,23 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         # Setup distributed environment
         setup_distributed(rank, world_size, master_addr, master_port)
         
-        # Calculate EBD2N partition configuration
-        num_input_workers = world_size - 2  # Exclude master and activation node
+        # FIXED: Calculate correct network topology
+        num_input_workers, calculated_activation_rank, num_weighted_workers, output_rank = calculate_network_topology(world_size)
+        
+        # Verify topology matches expected
+        if calculated_activation_rank != activation_rank:
+            debug_print(f"⚠️  Topology mismatch: calculated activation rank {calculated_activation_rank}, expected {activation_rank}", rank)
+            debug_print(f"Using provided activation rank {activation_rank}", rank)
+        
         partition_id = rank - 1  # Convert rank to 0-based partition index
         
         # EBD2N configuration
         input_size = 784  # d^[0] - MNIST image size
         output_size = 100  # d^[1] - activation layer size
         
-        # Verify divisibility constraint: d^[0] mod p^[0] = 0
+        # FIXED: Verify divisibility constraint with correct number of workers
         if input_size % num_input_workers != 0:
-            raise ValueError(f"EBD2N constraint violation: input size {input_size} must be divisible by number of partitions {num_input_workers}")
+            raise ValueError(f"EBD2N constraint violation: input size {input_size} must be divisible by number of input workers {num_input_workers}")
         
         partition_size = input_size // num_input_workers  # s^[0]
         
@@ -294,6 +302,7 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         )
         
         debug_print("✓ EBD2N partition initialized!", rank)
+        debug_print(f"FIXED: Network topology - Total input workers: {num_input_workers}", rank)
         debug_print(f"Partition ID: {partition_id}, Input size: {partition_size}, Output size: {output_size}", rank)
         debug_print(f"Weight matrix shape: {ebd2n_partition.W.shape}", rank)
         debug_print(f"Will send processed data to activation node (rank {activation_rank})", rank)
@@ -389,7 +398,7 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
                     microbatch_rate = total_processed_microbatches / elapsed if elapsed > 0 else 0
                     image_rate = total_processed_images / elapsed if elapsed > 0 else 0
                     unique_microbatches = len(processed_microbatches)
-                    print(f"[EBD2N-InputWorker {rank}] Processed {total_processed_microbatches} micro-batches ({total_processed_images} images) | MBatch rate: {microbatch_rate:.2f}/sec | Image rate: {image_rate:.2f}/sec | Unique: {unique_microbatches} | Out-of-order: {out_of_order_count} | EBD2N-COMPLIANT")
+                    print(f"[EBD2N-InputWorker {rank}] Processed {total_processed_microbatches} micro-batches ({total_processed_images} images) | MBatch rate: {microbatch_rate:.2f}/sec | Image rate: {image_rate:.2f}/sec | Unique: {unique_microbatches} | Out-of-order: {out_of_order_count} | FIXED-TOPOLOGY")
                     last_report_time = current_time
                 
                 # Detailed logging for first few micro-batches
@@ -402,11 +411,7 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
                     debug_print(f"  Weighted sum: {torch.sum(weighted_results).item():.4f}", rank)
                     debug_print(f"  Weight matrix norm: {torch.norm(ebd2n_partition.W).item():.4f}", rank)
                     debug_print(f"  EBD2N: Mathematical framework z_i^[0] = W_i^[0] @ x_i^[0]", rank)
-                
-                # TODO: Future backpropagation integration point
-                # When activation layer implements backprop, it will send error signals back
-                # Then we would call: ebd2n_partition.accumulate_gradients(microbatch_split, error_signal)
-                # And periodically: ebd2n_partition.update_weights(learning_rate=0.01)
+                    debug_print(f"  FIXED: Using correct number of input workers: {num_input_workers}", rank)
                 
             except RuntimeError as e:
                 error_msg = str(e).lower()
@@ -435,7 +440,7 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         ebd2n_stats = ebd2n_partition.get_statistics()
         
         if DEBUG:
-            print(f"\n[EBD2N-InputWorker {rank}] 📊 EBD2N FINAL STATISTICS:")
+            print(f"\n[EBD2N-InputWorker {rank}] 📊 EBD2N FIXED FINAL STATISTICS:")
             print(f"[EBD2N-InputWorker {rank}]   Total micro-batches processed: {total_processed_microbatches}")
             print(f"[EBD2N-InputWorker {rank}]   Total images processed: {total_processed_images}")
             print(f"[EBD2N-InputWorker {rank}]   Unique micro-batches processed: {unique_microbatches}")
@@ -444,19 +449,13 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
             print(f"[EBD2N-InputWorker {rank}]   Average micro-batch rate: {avg_microbatch_rate:.2f} micro-batches/second")
             print(f"[EBD2N-InputWorker {rank}]   Average image rate: {avg_image_rate:.2f} images/second")
             print(f"[EBD2N-InputWorker {rank}]   Average images per micro-batch: {total_processed_images/total_processed_microbatches:.1f}" if total_processed_microbatches > 0 else "")
+            print(f"[EBD2N-InputWorker {rank}]   FIXED: Correct number of input workers: {num_input_workers}")
             print(f"[EBD2N-InputWorker {rank}]   EBD2N: Mathematical framework compliance verified")
             print(f"[EBD2N-InputWorker {rank}]   EBD2N: Weight matrix shape: {ebd2n_stats['weight_shape']}")
             print(f"[EBD2N-InputWorker {rank}]   EBD2N: Weight matrix norm: {ebd2n_stats['weight_norm']:.4f}")
             print(f"[EBD2N-InputWorker {rank}]   EBD2N: Forward calls: {ebd2n_stats['forward_calls']}")
             print(f"[EBD2N-InputWorker {rank}]   EBD2N: Examples processed by partition: {ebd2n_stats['total_examples_processed']}")
             print(f"[EBD2N-InputWorker {rank}]   EBD2N: Ready for backpropagation integration")
-            
-            # Show some processed micro-batch IDs for verification
-            if processed_microbatches:
-                sample_microbatch_ids = sorted(list(processed_microbatches))[:10]
-                print(f"[EBD2N-InputWorker {rank}]   Sample processed micro-batch IDs: {sample_microbatch_ids}")
-                if len(processed_microbatches) > 10:
-                    print(f"[EBD2N-InputWorker {rank}]   ... and {len(processed_microbatches) - 10} more")
         
     except KeyboardInterrupt:
         debug_print("🛑 Interrupted by user", rank)
@@ -467,7 +466,7 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
             traceback.print_exc()
     finally:
         cleanup_distributed()
-        debug_print("👋 EBD2N enhanced input worker process terminated", rank)
+        debug_print("👋 EBD2N fixed input worker process terminated", rank)
 
 def get_local_ip():
     """Get the local IP address of this machine"""
@@ -484,7 +483,7 @@ def run_interactive_setup():
     """Interactive setup for worker configuration"""
     if DEBUG:
         print("=" * 60)
-        print("INTERACTIVE EBD2N ENHANCED INPUT WORKER SETUP")
+        print("INTERACTIVE EBD2N FIXED INPUT WORKER SETUP")
         print("=" * 60)
     
     # Get local IP for reference
@@ -492,6 +491,7 @@ def run_interactive_setup():
     if DEBUG:
         print(f"Local machine IP: {local_ip}")
         print("EBD2N: This worker implements mathematical framework compliance")
+        print("FIXED: Now correctly calculates network topology")
     
     # Get configuration from user
     try:
@@ -511,42 +511,48 @@ def run_interactive_setup():
     if not master_port:
         master_port = "12355"
     
-    world_size = input(f"Enter world size (total nodes including master) [4]: ").strip()
+    world_size = input(f"Enter world size (total nodes including master) [7]: ").strip()
     if not world_size:
-        world_size = 4
+        world_size = 7
     else:
         try:
             world_size = int(world_size)
         except ValueError:
-            print("Invalid world size. Using default 4.")
-            world_size = 4
+            print("Invalid world size. Using default 7.")
+            world_size = 7
     
-    # Calculate activation rank (last worker rank)
-    activation_rank = world_size - 1
+    # Calculate topology
+    num_input_workers, activation_rank, num_weighted_workers, output_rank = calculate_network_topology(world_size)
     
     # Verify EBD2N constraints
-    num_input_workers = world_size - 2
     input_size = 784
     if input_size % num_input_workers != 0:
         print(f"WARNING: EBD2N constraint violation!")
         print(f"Input size {input_size} must be divisible by number of input workers {num_input_workers}")
-        print(f"Consider using a different world size where {input_size} % {num_input_workers} = 0")
+        print(f"Current configuration gives partition size: {input_size / num_input_workers}")
         
-        common_divisors = [i for i in range(2, 20) if 784 % i == 0]
-        suggested_world_sizes = [d + 2 for d in common_divisors]  # +2 for master and activation
-        print(f"Suggested world sizes: {suggested_world_sizes}")
+        # Suggest alternative world sizes
+        valid_divisors = [i for i in range(1, 20) if 784 % i == 0]
+        suggested_world_sizes = []
+        for div in valid_divisors:
+            ws = div + 1 + 1 + 1 + 1  # input_workers + master + activation + weighted + output (minimum)
+            if ws <= 20:  # reasonable limit
+                suggested_world_sizes.append(ws)
+        
+        print(f"Valid input worker counts (784 divisors): {valid_divisors}")
+        print(f"Suggested world sizes for even division: {suggested_world_sizes[:10]}")  # Show first 10
         
         proceed = input("Continue anyway? [y/N]: ").strip().lower()
         if proceed not in ['y', 'yes']:
             return None
     
     if DEBUG:
-        print(f"\nEBD2N Configuration:")
+        print(f"\nFIXED EBD2N Configuration:")
         print(f"  Input worker rank: {rank}")
         print(f"  Master: {master_addr}:{master_port}")
         print(f"  World size: {world_size}")
         print(f"  Activation node rank: {activation_rank}")
-        print(f"  Number of input workers: {num_input_workers}")
+        print(f"  FIXED: Number of input workers: {num_input_workers}")
         print(f"  Partition size per worker: {input_size // num_input_workers}")
         print(f"  Local IP: {local_ip}")
         print(f"  EBD2N: Mathematical framework enabled")
@@ -559,15 +565,15 @@ def run_interactive_setup():
         return None
 
 def main():
-    """Main input worker entry point with multiple launch modes"""
+    """Main input worker entry point with fixed topology calculation"""
     global DEBUG
     
     # Set multiprocessing start method for compatibility
     mp.set_start_method('spawn', force=True)
     
-    parser = argparse.ArgumentParser(description='EBD2N Enhanced Distributed Input Worker Node')
+    parser = argparse.ArgumentParser(description='EBD2N Fixed Distributed Input Worker Node')
     parser.add_argument('--rank', type=int, help='Input worker rank (1, 2, ...)')
-    parser.add_argument('--world-size', type=int, default=4, help='Total world size including master and activation node')
+    parser.add_argument('--world-size', type=int, default=7, help='Total world size including master and activation node')
     parser.add_argument('--master-addr', default='192.168.1.191', help='Master node IP address')
     parser.add_argument('--master-port', default='12355', help='Master node port')
     parser.add_argument('--interactive', action='store_true', help='Run interactive setup')
@@ -592,33 +598,39 @@ def main():
         # Command line mode
         rank = args.rank
         world_size = args.world_size
-        activation_rank = world_size - 1  # Last rank is activation node
+        
+        # FIXED: Calculate activation rank correctly
+        num_input_workers, activation_rank, num_weighted_workers, output_rank = calculate_network_topology(world_size)
+        
         master_addr = args.master_addr
         master_port = args.master_port
     
     # Validate configuration
-    if rank >= activation_rank:
-        print(f"Error: Input worker rank {rank} must be less than activation rank {activation_rank}")
+    if rank >= world_size:
+        print(f"Error: Input worker rank {rank} must be less than world size {world_size}")
         return
     
     if rank < 1:
         print(f"Error: Input worker rank must be >= 1 (rank 0 is reserved for master)")
         return
     
-    # Validate EBD2N constraints
-    num_input_workers = world_size - 2
+    # FIXED: Validate EBD2N constraints with correct topology
+    num_input_workers, _, _, _ = calculate_network_topology(world_size)
     input_size = 784
     if input_size % num_input_workers != 0:
-        print(f"Error: EBD2N constraint violation!")
+        print(f"Error: FIXED EBD2N constraint violation!")
         print(f"Input size {input_size} must be divisible by number of input workers {num_input_workers}")
+        print(f"World size {world_size} results in {num_input_workers} input workers")
+        print(f"Partition size would be: {input_size / num_input_workers} (not an integer)")
         return
     
     if DEBUG:
-        print(f"\n🚀 Starting EBD2N enhanced input worker with configuration:")
+        print(f"\n🚀 Starting EBD2N fixed input worker with configuration:")
         print(f"   Rank: {rank}")
         print(f"   World size: {world_size}")
         print(f"   Master: {master_addr}:{master_port}")
         print(f"   Activation node rank: {activation_rank}")
+        print(f"   FIXED: Number of input workers: {num_input_workers}")
         print(f"   Debug mode: {DEBUG}")
         print(f"   EBD2N: Mathematical framework compliance enabled")
         print(f"   EBD2N: Partition size: {input_size // num_input_workers}")
@@ -645,7 +657,7 @@ def main():
             pass
     
     try:
-        # Run the EBD2N enhanced input worker
+        # Run the EBD2N fixed input worker
         worker_process(rank, world_size, activation_rank, master_addr, master_port)
     except KeyboardInterrupt:
         debug_print("🛑 Input worker interrupted by user")
