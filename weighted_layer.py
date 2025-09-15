@@ -331,7 +331,8 @@ class DistributedWeightedLayerWorker:
         input_dimension: int,             # d^[ℓ] (from previous activation layer)
         output_dimension: int,            # d^[ℓ+1] (to next activation layer)
         source_activation_rank: int,      # Rank of activation layer providing input
-        target_activation_rank: int,      # Rank of activation layer receiving output
+        target_output_rank: int,          # Rank of output layer receiving output
+        num_weighted_shards: int,         # EXPLICIT number of weighted shards
         learning_rate: float = 0.01,
         l2_regularization: float = 0.0001,
         device: torch.device = torch.device('cpu')
@@ -346,7 +347,8 @@ class DistributedWeightedLayerWorker:
             input_dimension: Input dimension d^[ℓ]
             output_dimension: Output dimension d^[ℓ+1]
             source_activation_rank: Rank of source activation layer
-            target_activation_rank: Rank of target activation layer
+            target_output_rank: Rank of target output layer
+            num_weighted_shards: EXPLICIT number of weighted shards (prevents auto-calculation bugs)
             learning_rate: Learning rate for weight updates
             l2_regularization: L2 regularization strength
             device: Computation device
@@ -355,23 +357,26 @@ class DistributedWeightedLayerWorker:
         self.world_size = world_size
         self.layer_id = layer_id
         self.source_activation_rank = source_activation_rank
-        self.target_activation_rank = target_activation_rank
+        self.target_output_rank = target_output_rank
         self.learning_rate = learning_rate
         self.l2_regularization = l2_regularization
         self.device = device
         
-        # Calculate weighted layer configuration
-        # For now, assume all weighted layer workers are consecutive ranks
-        # This can be made more flexible later
-        weighted_layer_start_rank = min([r for r in range(1, world_size) if r not in [source_activation_rank, target_activation_rank, 0]])
+        # Use explicit num_weighted_shards parameter (no auto-calculation)
+        self.num_weighted_shards = num_weighted_shards
         
-        # Calculate number of weighted layer shards and this shard's ID
-        self.num_weighted_shards = world_size - 3  # Exclude master, source activation, target activation
-        self.shard_id = rank - weighted_layer_start_rank  # Convert rank to shard index (0-based)
+        # Calculate this shard's ID based on rank and explicit shard configuration
+        # Assume weighted workers have ranks starting after activation layer
+        weighted_start_rank = source_activation_rank + 1
+        self.shard_id = rank - weighted_start_rank  # Convert rank to 0-based shard index
+        
+        # Validate shard ID is reasonable
+        if self.shard_id < 0 or self.shard_id >= num_weighted_shards:
+            raise ValueError(f"Invalid shard calculation: rank {rank}, shard_id {self.shard_id}, expected shard_id in [0, {num_weighted_shards-1}]")
         
         # Verify divisibility constraint
-        if output_dimension % self.num_weighted_shards != 0:
-            raise ValueError(f"Output dimension {output_dimension} must be divisible by number of weighted shards {self.num_weighted_shards}")
+        if output_dimension % num_weighted_shards != 0:
+            raise ValueError(f"Output dimension {output_dimension} must be divisible by number of weighted shards {num_weighted_shards}")
         
         # Create EBD2N weighted layer shard
         self.weighted_shard = EBD2NWeightedLayerShard(
@@ -379,7 +384,7 @@ class DistributedWeightedLayerWorker:
             layer_id=layer_id,
             input_dimension=input_dimension,
             output_dimension=output_dimension,
-            num_output_partitions=self.num_weighted_shards,
+            num_output_partitions=num_weighted_shards,
             device=device
         )
         
@@ -389,7 +394,10 @@ class DistributedWeightedLayerWorker:
         self.start_time = time.time()
         
         debug_print(f"Initialized weighted layer worker: layer_id={layer_id}, shard_id={self.shard_id}")
-        debug_print(f"Source activation: rank {source_activation_rank}, Target activation: rank {target_activation_rank}")
+        debug_print(f"Source activation: rank {source_activation_rank}, Target output: rank {target_output_rank}")
+        debug_print(f"Using {self.num_weighted_shards} weighted shards total")
+        debug_print(f"Weight shard shape: {self.weighted_shard.W_shard.shape}")
+        debug_print(f"Shard position in output: {self.weighted_shard.position}-{self.weighted_shard.position + self.weighted_shard.s_l_plus_1}")
     
     def receive_from_activation(self) -> Tuple[int, int, torch.Tensor]:
         """
@@ -427,7 +435,7 @@ class DistributedWeightedLayerWorker:
             microbatch_id: Unique identifier for this micro-batch
             
         Returns:
-            Shard output (microbatch_size × output_dimension)
+            Shard output (microbatch_size × shard_output_size)
         """
         # Forward pass through EBD2N weighted layer shard
         shard_output = self.weighted_shard.forward(microbatch_data)
@@ -441,9 +449,9 @@ class DistributedWeightedLayerWorker:
         
         return relevant_output
     
-    def send_to_activation(self, microbatch_size: int, microbatch_id: int, shard_output: torch.Tensor):
+    def send_to_output(self, microbatch_size: int, microbatch_id: int, shard_output: torch.Tensor):
         """
-        Send shard results to target activation layer.
+        Send shard results to target output layer.
         
         Args:
             microbatch_size: Size of the micro-batch
@@ -452,14 +460,14 @@ class DistributedWeightedLayerWorker:
         """
         # Send microbatch size
         microbatch_size_tensor = torch.tensor([microbatch_size], dtype=torch.long)
-        dist.send(microbatch_size_tensor, dst=self.target_activation_rank)
+        dist.send(microbatch_size_tensor, dst=self.target_output_rank)
         
         # Send microbatch ID
         microbatch_id_tensor = torch.tensor([microbatch_id], dtype=torch.long)
-        dist.send(microbatch_id_tensor, dst=self.target_activation_rank)
+        dist.send(microbatch_id_tensor, dst=self.target_output_rank)
         
         # Send shard results
-        dist.send(shard_output.flatten(), dst=self.target_activation_rank)
+        dist.send(shard_output.flatten(), dst=self.target_output_rank)
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get comprehensive worker statistics."""
@@ -475,7 +483,8 @@ class DistributedWeightedLayerWorker:
             'microbatch_rate': self.processed_microbatches / elapsed_time if elapsed_time > 0 else 0,
             'image_rate': self.processed_images / elapsed_time if elapsed_time > 0 else 0,
             'source_activation_rank': self.source_activation_rank,
-            'target_activation_rank': self.target_activation_rank
+            'target_output_rank': self.target_output_rank,
+            'num_weighted_shards': self.num_weighted_shards
         })
         
         return shard_stats
@@ -545,7 +554,8 @@ def weighted_layer_worker_process(
     input_dimension, 
     output_dimension,
     source_activation_rank,
-    target_activation_rank,
+    target_output_rank,
+    num_weighted_shards,
     master_addr, 
     master_port
 ):
@@ -569,7 +579,8 @@ def weighted_layer_worker_process(
             input_dimension=input_dimension,
             output_dimension=output_dimension,
             source_activation_rank=source_activation_rank,
-            target_activation_rank=target_activation_rank,
+            target_output_rank=target_output_rank,
+            num_weighted_shards=num_weighted_shards,
             learning_rate=0.01,
             l2_regularization=0.0001
         )
@@ -577,8 +588,9 @@ def weighted_layer_worker_process(
         debug_print("✓ EBD2N weighted layer worker initialized!", rank)
         debug_print(f"Layer ID: {layer_id}, Shard ID: {weighted_worker.shard_id}", rank)
         debug_print(f"Input dimension: {input_dimension}, Output dimension: {output_dimension}", rank)
-        debug_print(f"Source activation rank: {source_activation_rank}, Target activation rank: {target_activation_rank}", rank)
+        debug_print(f"Source activation rank: {source_activation_rank}, Target output rank: {target_output_rank}", rank)
         debug_print(f"Weight shard shape: {weighted_worker.weighted_shard.W_shard.shape}", rank)
+        debug_print(f"Number of weighted shards: {num_weighted_shards}", rank)
         debug_print("EBD2N: Vertical parallelism with padding enabled", rank)
         debug_print("Entering main processing loop...", rank)
         
@@ -609,8 +621,8 @@ def weighted_layer_worker_process(
                 # EBD2N MATHEMATICAL FRAMEWORK: Process through weighted layer shard
                 shard_output = weighted_worker.process_microbatch(activation_data, microbatch_id)
                 
-                # Send results to target activation layer
-                weighted_worker.send_to_activation(microbatch_size, microbatch_id, shard_output)
+                # Send results to target output layer
+                weighted_worker.send_to_output(microbatch_size, microbatch_id, shard_output)
                 
                 # Detailed logging for first few micro-batches
                 if DEBUG and weighted_worker.processed_microbatches <= 3:
@@ -620,7 +632,7 @@ def weighted_layer_worker_process(
                     debug_print(f"  Shard output shape: {shard_output.shape}", rank)
                     debug_print(f"  Input sum: {torch.sum(activation_data).item():.4f}", rank)
                     debug_print(f"  Output sum: {torch.sum(shard_output).item():.4f}", rank)
-                    debug_print(f"  EBD2N: Layer {layer_id}, Shard {weighted_worker.shard_id}", rank)
+                    debug_print(f"  EBD2N: Layer {layer_id}, Shard {weighted_worker.shard_id}/{num_weighted_shards}", rank)
                     debug_print(f"  EBD2N: Vertical parallelism applied", rank)
                 
                 # Progress reporting
@@ -629,7 +641,7 @@ def weighted_layer_worker_process(
                     elapsed = current_time - weighted_worker.start_time
                     microbatch_rate = weighted_worker.processed_microbatches / elapsed if elapsed > 0 else 0
                     image_rate = weighted_worker.processed_images / elapsed if elapsed > 0 else 0
-                    print(f"[EBD2N-WeightedLayer {rank}] Processed {weighted_worker.processed_microbatches} microbatches ({weighted_worker.processed_images} images) | Rate: {microbatch_rate:.2f} mb/s, {image_rate:.2f} img/s | Layer: {layer_id} | Shard: {weighted_worker.shard_id} | EBD2N-COMPLIANT")
+                    print(f"[EBD2N-WeightedLayer {rank}] Processed {weighted_worker.processed_microbatches} microbatches ({weighted_worker.processed_images} images) | Rate: {microbatch_rate:.2f} mb/s, {image_rate:.2f} img/s | Layer: {layer_id} | Shard: {weighted_worker.shard_id}/{num_weighted_shards} | EBD2N-COMPLIANT")
                     last_report_time = current_time
                     
             except RuntimeError as e:
@@ -678,12 +690,13 @@ def main():
     
     parser = argparse.ArgumentParser(description='EBD2N Enhanced Distributed Weighted Layer Worker Node')
     parser.add_argument('--rank', type=int, required=True, help='Weighted layer worker rank')
-    parser.add_argument('--world-size', type=int, default=6, help='Total world size including all nodes')
+    parser.add_argument('--world-size', type=int, required=True, help='Total world size including all nodes')
     parser.add_argument('--layer-id', type=int, default=1, help='Layer ID in the network (which weighted layer this is)')
-    parser.add_argument('--input-dimension', type=int, default=100, help='Input dimension from previous activation layer')
-    parser.add_argument('--output-dimension', type=int, default=50, help='Output dimension to next activation layer')
+    parser.add_argument('--input-dimension', type=int, required=True, help='Input dimension from previous activation layer')
+    parser.add_argument('--output-dimension', type=int, required=True, help='Output dimension to next layer')
     parser.add_argument('--source-activation-rank', type=int, required=True, help='Rank of source activation layer')
-    parser.add_argument('--target-activation-rank', type=int, required=True, help='Rank of target activation layer')
+    parser.add_argument('--target-output-rank', type=int, required=True, help='Rank of target output layer')
+    parser.add_argument('--num-weighted-shards', type=int, required=True, help='Number of weighted layer shards')
     parser.add_argument('--master-addr', default='192.168.1.191', help='Master node IP address')
     parser.add_argument('--master-port', default='12355', help='Master node port')
     parser.add_argument('--debug', action='store_true', default=True, help='Enable debug output (default: True)')
@@ -698,8 +711,8 @@ def main():
         DEBUG = args.debug
     
     # Validate arguments
-    if args.rank == args.source_activation_rank or args.rank == args.target_activation_rank:
-        print(f"Error: Weighted layer rank {args.rank} cannot be the same as activation layer ranks")
+    if args.rank == args.source_activation_rank or args.rank == args.target_output_rank:
+        print(f"Error: Weighted layer rank {args.rank} cannot be the same as activation/output layer ranks")
         return
         
     if args.rank == 0:
@@ -710,6 +723,14 @@ def main():
         print(f"Error: Input and output dimensions must be > 0")
         return
     
+    if args.num_weighted_shards <= 0:
+        print(f"Error: Number of weighted shards must be > 0")
+        return
+    
+    if args.output_dimension % args.num_weighted_shards != 0:
+        print(f"Error: Output dimension {args.output_dimension} must be divisible by number of weighted shards {args.num_weighted_shards}")
+        return
+    
     if DEBUG:
         print(f"\n🚀 Starting EBD2N weighted layer worker with configuration:")
         print(f"   Rank: {args.rank}")
@@ -718,7 +739,8 @@ def main():
         print(f"   Input dimension: {args.input_dimension}")
         print(f"   Output dimension: {args.output_dimension}")
         print(f"   Source activation rank: {args.source_activation_rank}")
-        print(f"   Target activation rank: {args.target_activation_rank}")
+        print(f"   Target output rank: {args.target_output_rank}")
+        print(f"   Number of weighted shards: {args.num_weighted_shards}")
         print(f"   Master: {args.master_addr}:{args.master_port}")
         print(f"   Debug mode: {DEBUG}")
         print(f"   EBD2N: Vertical parallelism with padding enabled")
@@ -732,7 +754,8 @@ def main():
             input_dimension=args.input_dimension,
             output_dimension=args.output_dimension,
             source_activation_rank=args.source_activation_rank,
-            target_activation_rank=args.target_activation_rank,
+            target_output_rank=args.target_output_rank,
+            num_weighted_shards=args.num_weighted_shards,
             master_addr=args.master_addr,
             master_port=args.master_port
         )

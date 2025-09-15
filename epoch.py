@@ -1,4 +1,4 @@
-# CORRECTED EPOCH / MASTER NODE FOR FULL EBD2N NETWORK TOPOLOGY
+# EPOCH / MASTER NODE FOR FULL EBD2N NETWORK TOPOLOGY
 # Supports: Input → Activation → Weighted → Output → Epoch
 
 import torch
@@ -40,6 +40,45 @@ def find_available_port(start_port=12355, end_port=12400):
         if check_port_available(str(port)):
             return str(port)
     raise RuntimeError(f"No available ports found in range {start_port}-{end_port}")
+
+def calculate_minimum_world_size(num_input_workers):
+    """
+    Calculate minimum world size based on network topology parameters.
+    
+    Args:
+        num_input_workers: Number of input worker processes
+        
+    Returns:
+        Minimum world size required
+    """
+    # Network topology:
+    # 1 master (rank 0)
+    # + num_input_workers input workers 
+    # + 1 activation layer 
+    # + 1 weighted worker (minimum)
+    # + 1 output layer
+    
+    min_world_size = 1 + num_input_workers + 1 + 1 + 1
+    return min_world_size  # = num_input_workers + 4
+
+def calculate_network_topology(world_size, num_input_workers):
+    """
+    Calculate network topology based on world size and parameters.
+    Auto-calculates number of weighted workers from remaining ranks.
+    
+    Returns:
+        tuple: (input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank)
+    """
+    input_worker_ranks = list(range(1, num_input_workers + 1))  # ranks 1, 2, ..., num_input_workers
+    activation_rank = num_input_workers + 1                     # rank num_input_workers+1
+    
+    # Calculate number of weighted workers automatically
+    num_weighted_workers = world_size - num_input_workers - 3  # -3 for master, activation, output
+    
+    weighted_worker_ranks = list(range(activation_rank + 1, activation_rank + 1 + num_weighted_workers))
+    output_rank = world_size - 1                               # last rank
+    
+    return input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank
 
 def setup_distributed(rank, world_size, master_addr="192.168.1.191", master_port="12355"):
     """Initialize distributed training with enhanced error handling"""
@@ -175,7 +214,7 @@ def send_shutdown_signals(world_size, input_worker_ranks, activation_rank, weigh
     except Exception as e:
         debug_print(f"Warning: Could not send shutdown to output layer {output_rank}: {e}")
 
-def create_master_engine(world_size, splits, batch_size, micro_batch_size, activation_size, output_dimension):
+def create_master_engine(world_size, num_input_workers, batch_size, micro_batch_size, activation_size, output_dimension):
     """Create the master node engine for full EBD2N network topology"""
     
     # Store dataset globally to avoid reloading
@@ -184,22 +223,23 @@ def create_master_engine(world_size, splits, batch_size, micro_batch_size, activ
     data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
     data_iter = iter(data_loader)
     
-    # Pre-calculate split size for efficiency
+    # Pre-calculate input partition size for efficiency
     vector_size = 784  # 28x28 MNIST images
-    split_size = vector_size // splits
+    input_partition_size = vector_size // num_input_workers
     
-    # Calculate network topology ranks
-    input_worker_ranks = list(range(1, splits + 1))  # ranks 1, 2
-    activation_rank = splits + 1                     # rank 3
-    num_weighted_workers = 2  # Fixed for this topology
-    weighted_worker_ranks = list(range(activation_rank + 1, activation_rank + 1 + num_weighted_workers))  # ranks 4, 5
-    output_rank = world_size - 1                     # rank 6
+    # Calculate network topology ranks using dynamic function
+    input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank = calculate_network_topology(
+        world_size, num_input_workers
+    )
+    
+    # Calculate number of weighted workers automatically
+    num_weighted_workers = len(weighted_worker_ranks)
     
     if DEBUG:
         debug_print(f"EBD2N Network Topology:")
         debug_print(f"  Input workers: {input_worker_ranks}")
         debug_print(f"  Activation layer: {activation_rank}")
-        debug_print(f"  Weighted workers: {weighted_worker_ranks}")
+        debug_print(f"  Weighted workers: {weighted_worker_ranks} (auto-calculated: {num_weighted_workers})")
         debug_print(f"  Output layer: {output_rank}")
     
     # Batch tracking variables
@@ -207,7 +247,7 @@ def create_master_engine(world_size, splits, batch_size, micro_batch_size, activ
     batch_number = 1
     
     # MICRO-BATCHING: Track pending micro-batches for proper synchronization
-    pending_microbatches = {}  # {microbatch_id: {'start_time': time, 'splits_sent': int, 'images': list}}
+    pending_microbatches = {}  # {microbatch_id: {'start_time': time, 'partitions_sent': int, 'images': list}}
     
     # Timing variables
     global_start_time = time.time()
@@ -278,50 +318,50 @@ def create_master_engine(world_size, splits, batch_size, micro_batch_size, activ
                 print(f"[Master]   Matrix shape: {micro_batch_matrix.shape}")
                 print(f"[Master]   Image indices: {micro_batch_indices}")
                 print(f"[Master]   Vector size: {vector_size}")
-                print(f"[Master]   Split size: {split_size}")
-                print(f"[Master]   Number of splits: {splits}")
+                print(f"[Master]   Input partition size: {input_partition_size}")
+                print(f"[Master]   Number of input workers: {num_input_workers}")
             
             # MICRO-BATCHING: Track this micro-batch as pending
             pending_microbatches[microbatch_id] = {
                 'start_time': microbatch_start_time,
-                'splits_sent': 0,
+                'partitions_sent': 0,
                 'images': micro_batch_images,
                 'labels': micro_batch_labels,
                 'indices': micro_batch_indices,
                 'micro_batch_size': len(micro_batch_images)
             }
             
-            # MICRO-BATCHING: Split the micro-batch matrix and send each split to corresponding input worker
-            for i in range(splits):
-                start_idx = i * split_size
-                end_idx = (i + 1) * split_size if i < splits - 1 else vector_size
+            # MICRO-BATCHING: Partition the micro-batch matrix and send each partition to corresponding input worker
+            for i in range(num_input_workers):
+                start_idx = i * input_partition_size
+                end_idx = (i + 1) * input_partition_size if i < num_input_workers - 1 else vector_size
                 
-                # Extract split from all images in the micro-batch
-                # micro_batch_split shape: (micro_batch_size, split_size)
-                micro_batch_split = micro_batch_matrix[:, start_idx:end_idx]
+                # Extract partition from all images in the micro-batch
+                # micro_batch_partition shape: (micro_batch_size, input_partition_size)
+                micro_batch_partition = micro_batch_matrix[:, start_idx:end_idx]
                 
-                # Pad split to fixed size for consistency if needed
-                if micro_batch_split.size(1) < split_size:
-                    padding_size = split_size - micro_batch_split.size(1)
-                    padding = torch.zeros(micro_batch_split.size(0), padding_size)
-                    micro_batch_split = torch.cat([micro_batch_split, padding], dim=1)
+                # Pad partition to fixed size for consistency if needed
+                if micro_batch_partition.size(1) < input_partition_size:
+                    padding_size = input_partition_size - micro_batch_partition.size(1)
+                    padding = torch.zeros(micro_batch_partition.size(0), padding_size)
+                    micro_batch_partition = torch.cat([micro_batch_partition, padding], dim=1)
                 
                 # Send to corresponding input worker
                 worker_rank = input_worker_ranks[i]
                 
                 try:
-                    # MICRO-BATCHING: Send micro-batch size, micro-batch ID, and micro-batch split
+                    # MICRO-BATCHING: Send micro-batch size, micro-batch ID, and micro-batch partition
                     microbatch_size_tensor = torch.tensor([len(micro_batch_images)], dtype=torch.long)
                     microbatch_id_tensor = torch.tensor([microbatch_id], dtype=torch.long)
                     
                     dist.send(microbatch_size_tensor, dst=worker_rank)
                     dist.send(microbatch_id_tensor, dst=worker_rank)
-                    dist.send(micro_batch_split.flatten(), dst=worker_rank)  # Flatten for transmission
+                    dist.send(micro_batch_partition.flatten(), dst=worker_rank)  # Flatten for transmission
                     
-                    pending_microbatches[microbatch_id]['splits_sent'] += 1
+                    pending_microbatches[microbatch_id]['partitions_sent'] += 1
                     
                     if DEBUG and engine.state.iteration <= 2:  # Show details for first few micro-batches
-                        print(f"[Master]   Split {i} -> Input Worker {worker_rank}: microbatch_id={microbatch_id}, size={len(micro_batch_images)}, shape={micro_batch_split.shape}")
+                        print(f"[Master]   Partition {i} -> Input Worker {worker_rank}: microbatch_id={microbatch_id}, size={len(micro_batch_images)}, shape={micro_batch_partition.shape}")
                     
                 except Exception as send_error:
                     debug_print(f"✗ Communication error with input worker rank {worker_rank} for micro-batch {microbatch_id}: {send_error}")
@@ -404,8 +444,8 @@ def create_master_engine(world_size, splits, batch_size, micro_batch_size, activ
                     'is_correct': is_correct,
                     'softmax_predictions': softmax_prediction.clone(),  # Store the full softmax vector
                     'vector_shape': original_image.shape,
-                    'total_splits': splits,
-                    'split_size': split_size,
+                    'total_input_workers': num_input_workers,
+                    'input_partition_size': input_partition_size,
                     'processing_time': microbatch_processing_time / len(original_images),  # Approximate per-image time
                     'microbatch_match': received_id == microbatch_id,
                     'microbatch_size': len(original_images),
@@ -536,24 +576,25 @@ def create_master_engine(world_size, splits, batch_size, micro_batch_size, activ
     
     return Engine(master_step)
 
-def run_master(splits=2, batch_size=50, micro_batch_size=5, activation_size=100, world_size=7, output_dimension=10, master_addr="192.168.1.191", master_port="12355"):
+def run_master(num_input_workers=2, batch_size=50, micro_batch_size=5, activation_size=100, world_size=7, output_dimension=10, master_addr="192.168.1.191", master_port="12355"):
     """Run the master node for full EBD2N network topology"""
     stats_print("STARTING CORRECTED EBD2N EPOCH NODE FOR FULL NETWORK TOPOLOGY")
     
-    # Calculate network topology ranks
-    input_worker_ranks = list(range(1, splits + 1))  # ranks 1, 2
-    activation_rank = splits + 1                     # rank 3
-    num_weighted_workers = 2  # Fixed for this topology
-    weighted_worker_ranks = list(range(activation_rank + 1, activation_rank + 1 + num_weighted_workers))  # ranks 4, 5
-    output_rank = world_size - 1                     # rank 6
+    # Calculate network topology ranks using dynamic function
+    input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank = calculate_network_topology(
+        world_size, num_input_workers
+    )
+    
+    # Calculate number of weighted workers automatically
+    num_weighted_workers = len(weighted_worker_ranks)
     
     # Configuration - show only in debug mode
     if DEBUG:
         stats_print(f"EBD2N Network Configuration:")
         stats_print(f"  World size: {world_size}")
-        stats_print(f"  Input workers: {input_worker_ranks} (splits: {splits})")
+        stats_print(f"  Input workers: {input_worker_ranks} (num_input_workers: {num_input_workers})")
         stats_print(f"  Activation layer: {activation_rank} (size: {activation_size})")
-        stats_print(f"  Weighted workers: {weighted_worker_ranks}")
+        stats_print(f"  Weighted workers: {weighted_worker_ranks} (auto-calculated: {num_weighted_workers})")
         stats_print(f"  Output layer: {output_rank} (classes: {output_dimension})")
         stats_print(f"  Batch size: {batch_size} | Micro-batch size: {micro_batch_size}")
         stats_print(f"  Address: {master_addr}:{master_port}")
@@ -561,7 +602,7 @@ def run_master(splits=2, batch_size=50, micro_batch_size=5, activation_size=100,
         print(f"[Master] MICRO-BATCHING: Communication reduction factor: {micro_batch_size}x")
         print(f"[Master] EBD2N: Full pipeline Input→Activation→Weighted→Output→Softmax")
     else:
-        stats_print(f"Starting EBD2N network: {splits} input + 1 activation + {num_weighted_workers} weighted + 1 output | batch size {batch_size}")
+        stats_print(f"Starting EBD2N network: {num_input_workers} input + 1 activation + {num_weighted_workers} weighted + 1 output | batch size {batch_size}")
     
     actual_port = None
     
@@ -578,7 +619,7 @@ def run_master(splits=2, batch_size=50, micro_batch_size=5, activation_size=100,
         time.sleep(2)
         
         # Create engine with full network topology
-        engine = create_master_engine(world_size, splits, batch_size, micro_batch_size, activation_size, output_dimension)
+        engine = create_master_engine(world_size, num_input_workers, batch_size, micro_batch_size, activation_size, output_dimension)
         
         # Add event handlers
         @engine.on(Events.ITERATION_COMPLETED)
@@ -661,6 +702,9 @@ def run_master(splits=2, batch_size=50, micro_batch_size=5, activation_size=100,
     except KeyboardInterrupt:
         stats_print("🛑 Received interrupt signal. Shutting down EBD2N network gracefully...")
         if world_size:
+            input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank = calculate_network_topology(
+                world_size, num_input_workers
+            )
             send_shutdown_signals(world_size, input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank)
         cleanup_distributed()
     except Exception as e:
@@ -669,6 +713,9 @@ def run_master(splits=2, batch_size=50, micro_batch_size=5, activation_size=100,
             import traceback
             traceback.print_exc()
         if world_size:
+            input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank = calculate_network_topology(
+                world_size, num_input_workers
+            )
             send_shutdown_signals(world_size, input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank)
         cleanup_distributed()
     
@@ -683,7 +730,7 @@ def main():
     
     parser = argparse.ArgumentParser(description='Corrected EBD2N Epoch Node for Full Network Topology')
     parser.add_argument('--world-size', type=int, default=7, help='Total world size including all nodes')
-    parser.add_argument('--splits', type=int, default=2, help='Number of input splits/workers')
+    parser.add_argument('--num-input-workers', type=int, default=2, help='Number of input worker processes')
     parser.add_argument('--batch-size', type=int, default=50, help='Batch size for processing')
     parser.add_argument('--micro-batch-size', type=int, default=5, help='Micro-batch size (images per communication event)')
     parser.add_argument('--activation-size', type=int, default=100, help='Size of activation layer')
@@ -710,12 +757,67 @@ def main():
         print("Warning: Micro-batch size larger than batch size, adjusting...")
         args.micro_batch_size = args.batch_size
     
-    if args.world_size < 7:
-        print(f"Error: World size must be at least 7 for full EBD2N topology (got {args.world_size})")
+    # Validate input partitioning constraint
+    if 784 % args.num_input_workers != 0:
+        print(f"Error: Input vector size (784) must be divisible by number of input workers {args.num_input_workers}")
+        valid_input_workers = [i for i in range(1, 21) if 784 % i == 0]
+        print(f"Valid input worker counts: {valid_input_workers}")
         return
     
+    # DYNAMIC WORLD SIZE VALIDATION - CORRECTED WITH SINGLE ARGUMENT
+    min_world_size = calculate_minimum_world_size(args.num_input_workers)
+    if args.world_size < min_world_size:
+        # Calculate actual num_weighted_workers for current world_size
+        available_for_weighted = max(0, args.world_size - args.num_input_workers - 3)
+        
+        print(f"Error: World size must be at least {min_world_size} for EBD2N topology with {args.num_input_workers} input workers (got {args.world_size})")
+        print(f"Network topology breakdown:")
+        print(f"  - 1 master (rank 0)")
+        print(f"  - {args.num_input_workers} input workers (ranks 1-{args.num_input_workers})")
+        print(f"  - 1 activation layer (rank {args.num_input_workers + 1})")
+        
+        if available_for_weighted > 0:
+            weighted_end_rank = args.num_input_workers + 1 + available_for_weighted
+            print(f"  - {available_for_weighted} weighted workers (ranks {args.num_input_workers + 2}-{weighted_end_rank})")
+            print(f"  - 1 output layer (rank {args.world_size - 1})")
+        else:
+            print(f"  - ERROR: No ranks available for weighted workers!")
+            print(f"  - 1 output layer would be (rank {args.world_size - 1})")
+            
+        print(f"  = Minimum required for at least 1 weighted worker: {min_world_size} nodes")
+        print(f"")
+        print(f"Examples of valid configurations:")
+        print(f"  - Minimal: --world-size {args.num_input_workers + 4} --num-input-workers {args.num_input_workers}")  
+        print(f"  - Larger:  --world-size {args.num_input_workers + 6} --num-input-workers {args.num_input_workers}")
+        return
+    
+    # Calculate and show final topology
+    input_worker_ranks, activation_rank, weighted_worker_ranks, output_rank = calculate_network_topology(
+        args.world_size, args.num_input_workers
+    )
+    num_weighted_workers = len(weighted_worker_ranks)
+    
+    # Validate output dimension divisibility by weighted workers
+    if args.output_dimension % num_weighted_workers != 0:
+        print(f"Error: Output dimension {args.output_dimension} must be divisible by number of weighted workers {num_weighted_workers}")
+        print(f"Current topology gives {num_weighted_workers} weighted workers from world_size {args.world_size}")
+        valid_output_dims = [i for i in range(1, 21) if i % num_weighted_workers == 0]
+        print(f"Valid output dimensions for {num_weighted_workers} weighted workers: {valid_output_dims}")
+        print(f"Or adjust --world-size to get different number of weighted workers")
+        return
+    
+    if DEBUG:
+        print(f"\n🚀 Starting EBD2N master with calculated topology:")
+        print(f"   World size: {args.world_size}")
+        print(f"   Input workers: {args.num_input_workers} (ranks {input_worker_ranks})")
+        print(f"   Activation layer: rank {activation_rank}")  
+        print(f"   Weighted workers: {num_weighted_workers} (ranks {weighted_worker_ranks}) - AUTO-CALCULATED")
+        print(f"   Output layer: rank {output_rank}")
+        print(f"   Output dimension: {args.output_dimension} (divisible by {num_weighted_workers} weighted workers)")
+        print(f"   Debug mode: {DEBUG}")
+    
     run_master(
-        splits=args.splits,
+        num_input_workers=args.num_input_workers,
         batch_size=args.batch_size,
         micro_batch_size=args.micro_batch_size,
         activation_size=args.activation_size,
