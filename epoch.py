@@ -684,7 +684,7 @@ def run_master(num_input_workers=2, batch_size=50, micro_batch_size=5, activatio
             cleanup_distributed()
         
         # Create dummy data for the engine
-        max_iterations = 10000 // micro_batch_size  # Maximum micro-batches we can process
+        max_iterations = 60000 // micro_batch_size  # Maximum micro-batches we can process
         dummy_data = [None] * max_iterations
         
         # Run the engine
