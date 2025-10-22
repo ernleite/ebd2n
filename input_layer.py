@@ -53,26 +53,30 @@ def get_env_or_default(env_var, default_value, var_type=str):
         debug_print(f"Warning: Invalid value for {env_var}='{value}', using default: {default_value}")
         return default_value
 
-def calculate_network_topology(world_size):
+def calculate_network_topology(world_size, num_input_workers):
     """
-    Calculate network topology based on world size.
+    Calculate network topology based on world size and number of input workers.
     
     EBD2N Network Structure:
     - Rank 0: Master/Epoch node
-    - Ranks 1 to N: Input workers (N = world_size - 4)
-    - Rank N+1: Activation layer
-    - Ranks N+2 to W-2: Weighted workers (at least 1)
-    - Rank W-1: Output layer (where W = world_size)
+    - Ranks 1 to num_input_workers: Input workers
+    - Rank num_input_workers+1: Activation layer
+    - Ranks num_input_workers+2 to world_size-2: Weighted workers (at least 1)
+    - Rank world_size-1: Output layer
+    
+    Args:
+        world_size: Total number of nodes
+        num_input_workers: Number of input layer workers
     
     Returns:
         tuple: (num_input_workers, activation_rank, num_weighted_workers, output_rank)
     """
-    if world_size < 5:
-        raise ValueError(f"World size must be at least 5 (got {world_size})")
+    min_world_size = num_input_workers + 4  # input_workers + master + activation + weighted(1) + output
+    if world_size < min_world_size:
+        raise ValueError(f"World size must be at least {min_world_size} for {num_input_workers} input workers (got {world_size})")
     
-    num_input_workers = world_size - 4  # Remaining after master, activation, weighted(1), output
     activation_rank = num_input_workers + 1
-    num_weighted_workers = world_size - num_input_workers - 3  # Should be at least 1
+    num_weighted_workers = world_size - num_input_workers - 3  # -3 for master, activation, output
     output_rank = world_size - 1
     
     return num_input_workers, activation_rank, num_weighted_workers, output_rank
@@ -268,7 +272,7 @@ def cleanup_distributed(rank):
         except:
             pass
 
-def worker_process(rank, world_size, activation_rank, master_addr, master_port):
+def worker_process(rank, world_size, num_input_workers, activation_rank, master_addr, master_port):
     """Main worker process for input layer node"""
     
     try:
@@ -282,7 +286,6 @@ def worker_process(rank, world_size, activation_rank, master_addr, master_port):
         setup_distributed(rank, world_size, master_addr, master_port)
         
         # Calculate partition parameters
-        num_input_workers, _, _, _ = calculate_network_topology(world_size)
         input_size = 784
         partition_size = input_size // num_input_workers
         partition_id = rank - 1  # 0-indexed partition ID
@@ -370,6 +373,7 @@ def main():
     
     # Get defaults from environment variables
     default_world_size = get_env_or_default('WORLD_SIZE', 7, int)
+    default_num_input_workers = get_env_or_default('NUM_INPUT_WORKERS', 2, int)
     default_master_addr = get_env_or_default('MASTER_ADDR', '192.168.1.191', str)
     default_master_port = get_env_or_default('MASTER_PORT', '12355', str)
     default_debug = get_env_or_default('DEBUG', True, bool)
@@ -386,6 +390,8 @@ def main():
                        help='Input worker rank (1, 2, ...) (env: RANK)')
     parser.add_argument('--world-size', type=int, default=default_world_size,
                        help='Total world size (env: WORLD_SIZE)')
+    parser.add_argument('--num-input-workers', type=int, default=default_num_input_workers,
+                       help='Number of input workers (env: NUM_INPUT_WORKERS)')
     parser.add_argument('--master-addr', default=default_master_addr,
                        help='Master IP address (env: MASTER_ADDR)')
     parser.add_argument('--master-port', default=default_master_port,
@@ -417,6 +423,7 @@ def main():
         print(f"  MASTER_ADDR: {args.master_addr} (from env: {os.getenv('MASTER_ADDR', 'not set')})")
         print(f"  MASTER_PORT: {args.master_port} (from env: {os.getenv('MASTER_PORT', 'not set')})")
         print(f"  WORLD_SIZE: {args.world_size} (from env: {os.getenv('WORLD_SIZE', 'not set')})")
+        print(f"  NUM_INPUT_WORKERS: {args.num_input_workers} (from env: {os.getenv('NUM_INPUT_WORKERS', 'not set')})")
         print(f"  Local IP: {local_ip}")
         print("=" * 60 + "\n")
     
@@ -436,7 +443,7 @@ def main():
         return
     
     # Calculate topology
-    num_input_workers, activation_rank, num_weighted_workers, output_rank = calculate_network_topology(args.world_size)
+    num_input_workers, activation_rank, num_weighted_workers, output_rank = calculate_network_topology(args.world_size, args.num_input_workers)
     
     # Validate this is an input worker rank
     if args.rank > num_input_workers:
@@ -476,7 +483,7 @@ def main():
             print(f"  4. No firewall blocking the connection")
     
     try:
-        worker_process(args.rank, args.world_size, activation_rank, args.master_addr, args.master_port)
+        worker_process(args.rank, args.world_size, args.num_input_workers, activation_rank, args.master_addr, args.master_port)
     except KeyboardInterrupt:
         debug_print("🛑 Input worker interrupted by user")
     except Exception as e:
