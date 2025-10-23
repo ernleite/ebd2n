@@ -128,12 +128,16 @@ def setup_distributed(rank, world_size, master_addr, master_port):
         print(f"[Master]   Master port: {master_port}")
     
     try:
-        # Initialize the process group with longer timeout
+        # Set environment variables for env:// init method (better for HPC)
+        os.environ['MASTER_ADDR'] = master_addr
+        os.environ['MASTER_PORT'] = str(master_port)
+        os.environ['RANK'] = str(rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        
+        # Initialize the process group with env:// method (HPC-friendly)
         dist.init_process_group(
             backend="gloo",  # More reliable for CPU-based communication
-            rank=rank, 
-            init_method=f"tcp://{master_addr}:{master_port}", 
-            world_size=world_size,
+            init_method="env://",  # Use env:// instead of tcp:// for HPC
             timeout=timedelta(minutes=3)  # Longer timeout
         )
         stats_print("✓ Successfully initialized process group")
@@ -297,7 +301,7 @@ def main():
     default_micro_batch_size = get_env_or_default('MICRO_BATCH_SIZE', 5, int)
     default_activation_size = get_env_or_default('ACTIVATION_SIZE', 100, int)
     default_output_dimension = get_env_or_default('OUTPUT_DIMENSION', 10, int)
-    default_master_addr = get_env_or_default('MASTER_ADDR', '192.168.1.191', str)
+    default_master_addr = get_env_or_default('MASTER_ADDR', '10.150.0.17', str)
     default_master_port = get_env_or_default('MASTER_PORT', '12355', str)
     default_debug = get_env_or_default('DEBUG', True, bool)
     
