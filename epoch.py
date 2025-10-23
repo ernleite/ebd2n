@@ -136,7 +136,7 @@ def setup_distributed(rank, world_size, master_addr, master_port):
         
         # Initialize the process group with env:// method (HPC-friendly)
         dist.init_process_group(
-            backend="mpi",  # More reliable for CPU-based communication
+            backend="nccl",  # More reliable for CPU-based communication
             init_method="env://",  # Use env:// instead of tcp:// for HPC
             timeout=timedelta(minutes=1)  # Longer timeout
         )
