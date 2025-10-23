@@ -139,6 +139,7 @@ def setup_distributed(rank, world_size, master_addr, master_port):
             backend="gloo",  # More reliable for CPU-based communication
             init_method="tcp://10.150.0.18:12355",
             rank=int(os.getenv("RANK")),
+            world_size=int(os.getenv("WORLD_SIZE")),
             timeout=timedelta(minutes=1)  # Longer timeout
         )
         stats_print("✓ Successfully initialized process group")
