@@ -13,7 +13,7 @@ export GLOO_SOCKET_IFNAME="eno1"
 
 # Master Node Configuration
 # IMPORTANT: Set this to the actual IP address of your master node
-export MASTER_ADDR="192.168.1.191"  # ← Change this to your master's IP (e.g., 10.150.0.17)
+export MASTER_ADDR="10.150.0.17"  # ← Change this to your master's IP (e.g., 10.150.0.17)
 export MASTER_PORT="12355"
 
 # Distributed Training Configuration
