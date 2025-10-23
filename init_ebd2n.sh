@@ -9,17 +9,20 @@
 ################################################################################
 
 # Network Interface (for Gloo backend)
-export GLOO_SOCKET_IFNAME="eno1"
+export GLOO_SOCKET_IFNAME="hsn0"
 
 # Master Node Configuration
 # IMPORTANT: Set this to the actual IP address of your master node
-export MASTER_ADDR="10.150.0.17"  # ← Change this to your master's IP (e.g., 10.150.0.17)
+export MASTER_ADDR="10.150.0.18"  # ← Change this to your master's IP (e.g., 10.150.0.17)
 export MASTER_PORT="12355"
 
 # Distributed Training Configuration
 export WORLD_SIZE=7                 # Total number of nodes (master + workers)
 export NUM_INPUT_WORKERS=2          # ← CRITICAL: Number of input layer workers (MUST be set!)
-export RANK=1                       # This node's rank (set appropriately per node)
+export RANK=1                     
+
+
+  # This node's rank (set appropriately per node)
 
 # IMPORTANT: NUM_INPUT_WORKERS determines network topology:
 #   - Input workers: ranks 1 to NUM_INPUT_WORKERS
