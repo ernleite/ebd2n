@@ -218,13 +218,21 @@ def setup_distributed(rank, world_size, master_addr, master_port):
     try:
         debug_print("Attempting to join process group...", rank)
         
-        # Initialize with longer timeout and better error messages
+        # Use file-based initialization (most reliable on HPC/Cray)
+        import pathlib
+        
+        # Use same init file as master
+        init_file = f"/tmp/ebd2n_init_{master_port}"
+        
+        debug_print(f"Using file-based init: {init_file}", rank)
+        
+        # Initialize with file:// method (no network needed!)
         dist.init_process_group(
-            backend="gloo",  # gloo is more reliable for CPU-based communication
+            backend="gloo",
+            init_method=f"file://{init_file}",
             rank=rank,
-            init_method=f"tcp://{master_addr}:{master_port}",
             world_size=world_size,
-            timeout=timedelta(minutes=3)  # Longer timeout
+            timeout=timedelta(minutes=3)
         )
         
         debug_print("✓ Successfully joined process group", rank)
@@ -374,7 +382,7 @@ def main():
     # Get defaults from environment variables
     default_world_size = get_env_or_default('WORLD_SIZE', 7, int)
     default_num_input_workers = get_env_or_default('NUM_INPUT_WORKERS', 2, int)
-    default_master_addr = get_env_or_default('MASTER_ADDR', '192.168.1.191', str)
+    default_master_addr = get_env_or_default('MASTER_ADDR', '10.150.0.17', str)
     default_master_port = get_env_or_default('MASTER_PORT', '12355', str)
     default_debug = get_env_or_default('DEBUG', True, bool)
     

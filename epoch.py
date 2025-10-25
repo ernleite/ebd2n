@@ -128,19 +128,25 @@ def setup_distributed(rank, world_size, master_addr, master_port):
         print(f"[Master]   Master port: {master_port}")
     
     try:
-        # Set environment variables for env:// init method (better for HPC)
-        os.environ['MASTER_ADDR'] = master_addr
-        os.environ['MASTER_PORT'] = str(master_port)
-        os.environ['RANK'] = str(rank)
-        os.environ['WORLD_SIZE'] = str(world_size)
+        # Use file-based initialization (most reliable on HPC/Cray)
+        import pathlib
         
-        # Initialize the process group with env:// method (HPC-friendly)
+        # Create shared init file in /tmp
+        init_file = f"/tmp/ebd2n_init_{master_port}"
+        
+        # Clean up old file if exists (master only)
+        if rank == 0:
+            pathlib.Path(init_file).unlink(missing_ok=True)
+        
+        debug_print(f"Using file-based init: {init_file}")
+        
+        # Initialize with file:// method (no network needed!)
         dist.init_process_group(
-            backend="gloo",  # More reliable for CPU-based communication
-            init_method="tcp://10.150.0.18:12355",
-            rank=int(os.getenv("RANK")),
-            world_size=int(os.getenv("WORLD_SIZE")),
-            timeout=timedelta(minutes=1)  # Longer timeout
+            backend="gloo",
+            init_method=f"file://{init_file}",
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(minutes=3)
         )
         stats_print("✓ Successfully initialized process group")
         
