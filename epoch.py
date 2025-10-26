@@ -140,13 +140,16 @@ def setup_distributed(rank, world_size, master_addr, master_port):
         
         debug_print(f"Using file-based init: {init_file}")
         
-        # Initialize with file:// method (no network needed!)
+        # NEW (env-based - opens TCP port)
+        os.environ['MASTER_ADDR'] = master_addr
+        os.environ['MASTER_PORT'] = master_port
+
         dist.init_process_group(
             backend="gloo",
-            init_method=f"file://{init_file}",
+            init_method="env://",  # Use TCP instead of file
             rank=rank,
             world_size=world_size,
-            timeout=timedelta(minutes=3)
+            timeout=timedelta(minutes=10)
         )
         stats_print("✓ Successfully initialized process group")
         
