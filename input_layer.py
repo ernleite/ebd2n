@@ -229,10 +229,10 @@ def setup_distributed(rank, world_size, master_addr, master_port):
         # Initialize with file:// method (no network needed!)
         dist.init_process_group(
             backend="gloo",
-            init_method=f"file://{init_file}",
+            init_method="env://",  # Use TCP instead of file
             rank=rank,
             world_size=world_size,
-            timeout=timedelta(minutes=3)
+            timeout=timedelta(minutes=10)
         )
         
         debug_print("✓ Successfully joined process group", rank)

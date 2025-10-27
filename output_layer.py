@@ -563,10 +563,10 @@ def setup_distributed(rank, world_size, master_addr="192.168.1.191", master_port
         # Initialize with longer timeout
         dist.init_process_group(
             backend="gloo",
+            init_method="env://",  # Use TCP instead of file
             rank=rank,
-            init_method=f"tcp://{master_addr}:{master_port}",
             world_size=world_size,
-            timeout=timedelta(minutes=3)
+            timeout=timedelta(minutes=10)
         )
         
         debug_print("✓ Successfully joined process group", rank)
