@@ -1,6 +1,7 @@
 # EPOCH / MASTER NODE FOR FULL EBD2N NETWORK TOPOLOGY
 # ENHANCED: Reads configuration from environment variables with fallback chain
 # Priority: Command-line args → Environment variables → Hardcoded defaults
+#filename epoch.py
 
 import torch
 import torch.distributed as dist

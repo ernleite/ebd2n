@@ -1,6 +1,7 @@
 # EBD2N OUTPUT LAYER NODE WITH SOFTMAX AND LOSS COMPUTATION
 # Implements final layer processing with conditional aggregation and backpropagation support
 
+#filename output_layer.py
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp

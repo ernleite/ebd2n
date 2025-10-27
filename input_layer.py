@@ -1,6 +1,7 @@
 # EBD2N INPUT LAYER NODE WITH DYNAMIC CONFIGURATION
 # ENHANCED: Reads configuration from environment variables with fallback chain
 # Priority: Command-line args → Environment variables → Hardcoded defaults
+#filename input_layer.py
 
 import torch
 import torch.distributed as dist

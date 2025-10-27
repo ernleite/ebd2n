@@ -1,5 +1,6 @@
 # EBD2N WEIGHTED LAYER NODE WITH LAYER AWARENESS AND MATHEMATICAL FRAMEWORK
 # Implements vertical parallelism with padding for distributed matrix multiplication
+#filename weighted_layer.py
 
 import torch
 import torch.distributed as dist

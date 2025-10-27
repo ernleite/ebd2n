@@ -1,5 +1,6 @@
 # EBD2N ENHANCED ACTIVATION LAYER NODE WITH CORRECTED FLOW
 # FIXED: Now properly sends to weighted layer instead of master
+#filename activation_layer.py
 
 import torch
 import torch.distributed as dist
